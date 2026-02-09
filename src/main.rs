@@ -44,11 +44,11 @@ use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::util::config::UserConfig;
 use lightning::util::hash_tables::hash_map::Entry;
 use lightning::util::hash_tables::HashMap;
+use lightning::util::logger::Logger;
 use lightning::util::persist::{
 	self, KVStore, MonitorUpdatingPersisterAsync, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use lightning::util::logger::Logger;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 use lightning::util::sweep as ldk_sweep;
 use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
@@ -318,8 +318,7 @@ fn send_probe(
 fn read_probe_file(ldk_data_dir: &str) -> Result<ProbeConfig, std::io::Error> {
 	let prober_file = format!("{}/prober_config.json", ldk_data_dir);
 	let file = fs::read_to_string(prober_file)?;
-	let config: ProbeConfig = serde_json::from_str(&file)
-		.map_err(std::io::Error::other)?;
+	let config: ProbeConfig = serde_json::from_str(&file).map_err(std::io::Error::other)?;
 	Ok(config)
 }
 
@@ -1414,7 +1413,7 @@ async fn start_ldk() {
 			}
 		},
 		Err(_) => println!(
-			"WARNING: prober_config.json is missing at {}/prober_config.json. Probing disabled.",
+			"WARNING: prober_config.json at {}/prober_config.json is missing or malformed. Probing disabled.",
 			ldk_data_dir
 		),
 	};
@@ -1461,10 +1460,7 @@ async fn start_ldk() {
 			.await
 			.unwrap();
 		use lightning::util::logger::Logger;
-		lightning::log_error!(
-			&*logger,
-			"Last-ditch ChannelManager persistence completed"
-		);
+		lightning::log_error!(&*logger, "Last-ditch ChannelManager persistence completed");
 		panic!(
 			"ERR: background processing stopped with result {:?}, exiting.\n\
 			Last-ditch ChannelManager persistence completed",
