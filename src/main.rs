@@ -82,7 +82,43 @@ pub(crate) enum HTLCStatus {
 struct ProbeConfig {
 	probe_interval_sec: u64,
 	probe_peers: Vec<String>,
-	max_amount_msats: u64,
+	probe_amount_msats: Vec<u64>,
+	#[serde(default = "default_probe_timeout_sec")]
+	probe_timeout_sec: u64,
+}
+
+fn default_probe_timeout_sec() -> u64 {
+	60
+}
+
+#[derive(Clone, Debug)]
+enum ProbeOutcome {
+	Success,
+	Failed,
+}
+
+struct ProbeTracker {
+	pending_probes: StdHashMap<PaymentHash, tokio::sync::oneshot::Sender<ProbeOutcome>>,
+}
+
+impl ProbeTracker {
+	fn new() -> Self {
+		Self { pending_probes: StdHashMap::new() }
+	}
+
+	fn register_probe(
+		&mut self, payment_hash: PaymentHash,
+	) -> tokio::sync::oneshot::Receiver<ProbeOutcome> {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.pending_probes.insert(payment_hash, tx);
+		rx
+	}
+
+	fn complete_probe(&mut self, payment_hash: &PaymentHash, outcome: ProbeOutcome) {
+		if let Some(sender) = self.pending_probes.remove(payment_hash) {
+			let _ = sender.send(outcome);
+		}
+	}
 }
 
 impl_writeable_tlv_based_enum!(HTLCStatus,
@@ -225,27 +261,24 @@ fn prepare_probe(
 	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &disk::FilesystemLogger,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
 	pub_key_hex: &str, probe_amount: u64,
-) {
+) -> Option<PaymentHash> {
 	if probe_amount == 0 {
-		return;
+		return None;
 	}
-	let amt = ::rand::random::<u64>() % probe_amount;
-	let pub_key_bytes = match hex_utils::to_vec(pub_key_hex) {
-		Some(bytes) => bytes,
-		None => return,
-	};
+	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)?;
 	if let Ok(pk) = bitcoin::secp256k1::PublicKey::from_slice(&pub_key_bytes) {
-		send_probe(channel_manager, pk, graph, logger, amt, scorer);
+		return send_probe(channel_manager, pk, graph, logger, probe_amount, scorer);
 	}
+	None
 }
 
 fn send_probe(
 	channel_manager: &ChannelManager, recipient: PublicKey, graph: &NetworkGraph,
 	logger: &disk::FilesystemLogger, amt_msat: u64,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
-) {
+) -> Option<PaymentHash> {
 	let chans = channel_manager.list_usable_channels();
-	let chan_refs = chans.iter().map(|a| a).collect::<Vec<_>>();
+	let chan_refs = chans.iter().collect::<Vec<_>>();
 	let mut payment_params = PaymentParameters::from_node_id(recipient, 144);
 	payment_params.max_path_count = 1;
 	let in_flight_htlcs = channel_manager.compute_inflight_htlcs();
@@ -255,7 +288,7 @@ fn send_probe(
 	let route_res = lightning::routing::router::find_route(
 		&channel_manager.get_our_node_id(),
 		&RouteParameters::from_payment_params_and_value(payment_params, amt_msat),
-		&graph,
+		graph,
 		Some(&chan_refs),
 		logger,
 		&inflight_scorer,
@@ -263,10 +296,14 @@ fn send_probe(
 		&[32; 32],
 	);
 	if let Ok(route) = route_res {
-		for path in route.paths {
-			let _ = channel_manager.send_probe(path);
+		// We only send one probe per call (max_path_count = 1), so take the first path
+		if let Some(path) = route.paths.into_iter().next() {
+			if let Ok((payment_hash, _)) = channel_manager.send_probe(path) {
+				return Some(payment_hash);
+			}
 		}
 	}
+	None
 }
 
 fn read_probe_file(ldk_data_dir: &str) -> Result<ProbeConfig, std::io::Error> {
@@ -283,7 +320,8 @@ fn handle_ldk_events<'a>(
 	bump_tx_event_handler: &'a BumpTxEventHandler, peer_manager: Arc<PeerManager>,
 	inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
 	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
-	output_sweeper: OutputSweeperWrapper, network: Network, event: Event,
+	output_sweeper: OutputSweeperWrapper, network: Network,
+	probe_tracker: Arc<Mutex<ProbeTracker>>, event: Event,
 ) -> impl core::future::Future<Output = ()> + 'a {
 	async move {
 		match event {
@@ -470,8 +508,12 @@ fn handle_ldk_events<'a>(
 			},
 			Event::PaymentPathSuccessful { .. } => {},
 			Event::PaymentPathFailed { .. } => {},
-			Event::ProbeSuccessful { .. } => {},
-			Event::ProbeFailed { .. } => {},
+			Event::ProbeSuccessful { payment_hash, .. } => {
+				probe_tracker.lock().unwrap().complete_probe(&payment_hash, ProbeOutcome::Success);
+			},
+			Event::ProbeFailed { payment_hash, .. } => {
+				probe_tracker.lock().unwrap().complete_probe(&payment_hash, ProbeOutcome::Failed);
+			},
 			Event::PaymentFailed { payment_hash, reason, payment_id, .. } => {
 				if let Some(hash) = payment_hash {
 					print!(
@@ -1086,6 +1128,8 @@ async fn start_ldk() {
 	let fs_store_event_listener = Arc::clone(&fs_store);
 	let peer_manager_event_listener = Arc::clone(&peer_manager);
 	let output_sweeper_event_listener = Arc::clone(&output_sweeper);
+	let probe_tracker = Arc::new(Mutex::new(ProbeTracker::new()));
+	let probe_tracker_event_listener = Arc::clone(&probe_tracker);
 	let network = args.network;
 	let event_handler = move |event: Event| {
 		let channel_manager_event_listener = Arc::clone(&channel_manager_event_listener);
@@ -1098,6 +1142,7 @@ async fn start_ldk() {
 		let fs_store_event_listener = Arc::clone(&fs_store_event_listener);
 		let peer_manager_event_listener = Arc::clone(&peer_manager_event_listener);
 		let output_sweeper_event_listener = Arc::clone(&output_sweeper_event_listener);
+		let probe_tracker_event_listener = Arc::clone(&probe_tracker_event_listener);
 		async move {
 			handle_ldk_events(
 				channel_manager_event_listener,
@@ -1111,6 +1156,7 @@ async fn start_ldk() {
 				fs_store_event_listener,
 				OutputSweeperWrapper(output_sweeper_event_listener),
 				network,
+				probe_tracker_event_listener,
 				event,
 			)
 			.await;
@@ -1231,29 +1277,77 @@ async fn start_ldk() {
 	let probing_graph = Arc::clone(&network_graph);
 	let probing_logger = Arc::clone(&logger);
 	let probing_scorer = Arc::clone(&scorer);
+	let probing_tracker = Arc::clone(&probe_tracker);
 	match read_probe_file(&ldk_data_dir) {
 		Ok(probe_config) => {
 			if probe_config.probe_peers.is_empty() {
 				println!("WARNING: prober_config.json has no probe_peers. Probing disabled.");
+			} else if probe_config.probe_amount_msats.is_empty() {
+				println!(
+					"WARNING: prober_config.json has no probe_amount_msats. Probing disabled."
+				);
 			} else {
-				let mut index = 0usize;
+				// Sort amounts ascending (smallest to largest)
+				let mut sorted_amounts = probe_config.probe_amount_msats.clone();
+				sorted_amounts.sort();
+
+				let probe_timeout = Duration::from_secs(probe_config.probe_timeout_sec);
+
 				tokio::spawn(async move {
 					let mut interval =
 						tokio::time::interval(Duration::from_secs(probe_config.probe_interval_sec));
 					loop {
 						interval.tick().await;
-						if index >= probe_config.probe_peers.len() {
-							index = 0;
+
+						// Probe each peer with amounts from smallest to largest
+						for peer in &probe_config.probe_peers {
+							'amounts: for &amount in &sorted_amounts {
+								// Send the probe and get the payment hash
+								let payment_hash = prepare_probe(
+									&probing_cm,
+									&probing_graph,
+									&probing_logger,
+									&probing_scorer,
+									peer,
+									amount,
+								);
+
+								if let Some(hash) = payment_hash {
+									// Register the probe and get a receiver for the outcome
+									let rx = probing_tracker.lock().unwrap().register_probe(hash);
+
+									// Wait for the probe outcome with timeout
+									let outcome = tokio::time::timeout(probe_timeout, rx).await;
+
+									match outcome {
+										Ok(Ok(ProbeOutcome::Success)) => {
+											// Probe succeeded, continue to next amount
+										},
+										Ok(Ok(ProbeOutcome::Failed)) => {
+											// Probe failed, skip remaining amounts for this peer
+											break 'amounts;
+										},
+										Ok(Err(_)) => {
+											// Channel closed (sender dropped), skip remaining amounts
+											break 'amounts;
+										},
+										Err(_) => {
+											// Timeout - probe is stuck, skip remaining amounts
+											// Clean up the pending probe to avoid memory leak
+											probing_tracker
+												.lock()
+												.unwrap()
+												.pending_probes
+												.remove(&hash);
+											break 'amounts;
+										},
+									}
+								} else {
+									// Could not send probe (no route found, etc.), skip remaining amounts
+									break 'amounts;
+								}
+							}
 						}
-						prepare_probe(
-							&*probing_cm,
-							&*probing_graph,
-							&*probing_logger,
-							&*probing_scorer,
-							&probe_config.probe_peers[index],
-							probe_config.max_amount_msats,
-						);
-						index += 1;
 					}
 				});
 			}

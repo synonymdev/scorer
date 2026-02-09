@@ -4,5 +4,6 @@
     "03cc91150efc4bbe8d9f8ced06fbc81ad50b076b9759139e4c2d7a8380566da7e1",
     "037d8e050899fa0732fdd6fc1e0d5d8d685c2093932a7e10dc5e6fab8a34ed1c43"
   ],
-  "max_amount_msats": 500000000
+  "probe_amount_msats": [1_000, 10_000_000, 100_000_000, 500_000_000],
+  "probe_timeout_sec": 3
 }
