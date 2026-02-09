@@ -48,6 +48,7 @@ use lightning::util::persist::{
 	self, KVStore, MonitorUpdatingPersisterAsync, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
+use lightning::util::logger::Logger;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 use lightning::util::sweep as ldk_sweep;
 use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
@@ -256,6 +257,14 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
 
 // Needed due to rust-lang/rust#63033.
 struct OutputSweeperWrapper(Arc<OutputSweeper>);
+
+fn truncate_pubkey(pubkey: &str) -> String {
+	if pubkey.len() > 12 {
+		format!("{}...", &pubkey[..12])
+	} else {
+		pubkey.to_string()
+	}
+}
 
 fn prepare_probe(
 	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &disk::FilesystemLogger,
@@ -1295,6 +1304,17 @@ async fn start_ldk() {
 
 				let probe_timeout = Duration::from_secs(probe_config.probe_timeout_sec);
 
+				// Log startup configuration
+				lightning::log_info!(
+					&*probing_logger,
+					"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s",
+					probe_config.probe_peers.len(),
+					sorted_amounts.len(),
+					sorted_amounts,
+					probe_config.probe_interval_sec,
+					probe_config.probe_timeout_sec
+				);
+
 				tokio::spawn(async move {
 					let mut interval =
 						tokio::time::interval(Duration::from_secs(probe_config.probe_interval_sec));
@@ -1303,6 +1323,7 @@ async fn start_ldk() {
 
 						// Probe each peer with amounts from smallest to largest
 						for peer in &probe_config.probe_peers {
+							let peer_short = truncate_pubkey(peer);
 							'amounts: for &amount in &sorted_amounts {
 								// Send the probe and get the payment hash
 								let payment_hash = prepare_probe(
@@ -1315,6 +1336,14 @@ async fn start_ldk() {
 								);
 
 								if let Some(hash) = payment_hash {
+									lightning::log_info!(
+										&*probing_logger,
+										"Probe SENT to {} for {} msat (hash: {})",
+										peer_short,
+										amount,
+										hash
+									);
+
 									// Register the probe and get a receiver for the outcome
 									let rx = probing_tracker.lock().unwrap().register_probe(hash);
 
@@ -1323,18 +1352,43 @@ async fn start_ldk() {
 
 									match outcome {
 										Ok(Ok(ProbeOutcome::Success)) => {
+											lightning::log_info!(
+												&*probing_logger,
+												"Probe SUCCESS to {} for {} msat (hash: {})",
+												peer_short,
+												amount,
+												hash
+											);
 											// Probe succeeded, continue to next amount
 										},
 										Ok(Ok(ProbeOutcome::Failed)) => {
-											// Probe failed, skip remaining amounts for this peer
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_short,
+												amount,
+												hash
+											);
 											break 'amounts;
 										},
 										Ok(Err(_)) => {
-											// Channel closed (sender dropped), skip remaining amounts
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
+												peer_short,
+												amount,
+												hash
+											);
 											break 'amounts;
 										},
 										Err(_) => {
-											// Timeout - probe is stuck, skip remaining amounts
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_short,
+												amount,
+												hash
+											);
 											// Clean up the pending probe to avoid memory leak
 											probing_tracker
 												.lock()
@@ -1345,7 +1399,12 @@ async fn start_ldk() {
 										},
 									}
 								} else {
-									// Could not send probe (no route found, etc.), skip remaining amounts
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
+										peer_short,
+										amount
+									);
 									break 'amounts;
 								}
 							}
