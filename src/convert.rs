@@ -80,7 +80,6 @@ impl TryInto<MempoolMinFeeResponse> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> std::io::Result<MempoolMinFeeResponse> {
 		let errored = !self.0["errors"].is_null();
-		assert_eq!(self.0["maxmempool"].as_u64(), Some(300000000));
 		Ok(MempoolMinFeeResponse {
 			errored,
 			// Bitcoin Core gives us a feerate in BTC/KvB, which we need to convert to
