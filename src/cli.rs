@@ -125,7 +125,7 @@ pub(crate) async fn poll_for_user_input(
 						continue;
 					}
 					let (mut announce_channel, mut with_anchors) = (false, false);
-					while let Some(word) = words.next() {
+					for word in words.by_ref() {
 						match word {
 							"--public" | "--public=true" => announce_channel = true,
 							"--public=false" => announce_channel = false,
@@ -307,10 +307,10 @@ pub(crate) async fn poll_for_user_input(
 									&invoice,
 									user_provided_amt,
 									&outbound_payments,
-									&*fs_store,
-								)
-								.await
-							},
+							&fs_store,
+						)
+						.await
+					},
 							Err(e) => {
 								println!("ERROR: invalid invoice: {:?}", e);
 							},
@@ -345,15 +345,15 @@ pub(crate) async fn poll_for_user_input(
 							continue;
 						},
 					};
-					keysend(
-						&channel_manager,
-						dest_pubkey,
-						amt_msat,
-						&*keys_manager,
-						&outbound_payments,
-						&*fs_store,
-					)
-					.await;
+				keysend(
+					&channel_manager,
+					dest_pubkey,
+					amt_msat,
+					&*keys_manager,
+					&outbound_payments,
+					&fs_store,
+				)
+				.await;
 				},
 				"getoffer" => {
 					let offer_builder = channel_manager.create_offer_builder();
@@ -363,8 +363,8 @@ pub(crate) async fn poll_for_user_input(
 					}
 
 					let amt_str = words.next();
-					let offer = if amt_str.is_some() {
-						let amt_msat: Result<u64, _> = amt_str.unwrap().parse();
+					let offer = if let Some(amt) = amt_str {
+						let amt_msat: Result<u64, _> = amt.parse();
 						if amt_msat.is_err() {
 							println!("ERROR: getoffer provided payment amount was not a number");
 							continue;
@@ -452,7 +452,7 @@ pub(crate) async fn poll_for_user_input(
 						match bitcoin::secp256k1::PublicKey::from_str(peer_pubkey.unwrap()) {
 							Ok(pubkey) => pubkey,
 							Err(e) => {
-								println!("ERROR: {}", e.to_string());
+								println!("ERROR: {}", e);
 								continue;
 							},
 						};
@@ -550,7 +550,7 @@ pub(crate) async fn poll_for_user_input(
 				"listpeers" => list_peers(peer_manager.clone()),
 				"signmessage" => {
 					const MSG_STARTPOS: usize = "signmessage".len() + 1;
-					if line.trim().as_bytes().len() <= MSG_STARTPOS {
+					if line.trim().len() <= MSG_STARTPOS {
 						println!("ERROR: signmsg requires a message");
 						continue;
 					}
@@ -652,7 +652,7 @@ fn list_peers(peer_manager: Arc<PeerManager>) {
 fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<NetworkGraph>) {
 	print!("[");
 	for chan_info in channel_manager.list_channels() {
-		println!("");
+		println!();
 		println!("\t{{");
 		println!("\t\tchannel_id: {},", chan_info.channel_id);
 		if let Some(funding_txo) = chan_info.funding_txo {
@@ -695,7 +695,7 @@ fn list_payments(
 ) {
 	print!("[");
 	for (payment_hash, payment_info) in &inbound_payments.payments {
-		println!("");
+		println!();
 		println!("\t{{");
 		println!("\t\tamount_millisatoshis: {},", payment_info.amt_msat);
 		println!("\t\tpayment_hash: {},", payment_hash);
@@ -713,7 +713,7 @@ fn list_payments(
 	}
 
 	for (payment_hash, payment_info) in &outbound_payments.payments {
-		println!("");
+		println!();
 		println!("\t{{");
 		println!("\t\tamount_millisatoshis: {},", payment_info.amt_msat);
 		println!("\t\tpayment_hash: {},", payment_hash);
@@ -809,11 +809,11 @@ fn open_channel(
 	match channel_manager.create_channel(peer_pubkey, channel_amt_sat, 0, 0, None, Some(config)) {
 		Ok(_) => {
 			println!("EVENT: initiated channel with peer {}. ", peer_pubkey);
-			return Ok(());
+			Ok(())
 		},
 		Err(e) => {
 			println!("ERROR: failed to open channel: {:?}", e);
-			return Err(());
+			Err(())
 		},
 	}
 }
@@ -939,9 +939,11 @@ fn get_invoice(
 	amt_msat: u64, inbound_payments: &mut InboundPaymentInfoStorage,
 	channel_manager: &ChannelManager, expiry_secs: u32,
 ) {
-	let mut invoice_params: Bolt11InvoiceParameters = Default::default();
-	invoice_params.amount_msats = Some(amt_msat);
-	invoice_params.invoice_expiry_delta_secs = Some(expiry_secs);
+	let invoice_params = Bolt11InvoiceParameters {
+		amount_msats: Some(amt_msat),
+		invoice_expiry_delta_secs: Some(expiry_secs),
+		..Default::default()
+	};
 	let invoice = match channel_manager.create_bolt11_invoice(invoice_params) {
 		Ok(inv) => {
 			println!("SUCCESS: generated invoice: {}", inv);
@@ -958,7 +960,7 @@ fn get_invoice(
 		payment_hash,
 		PaymentInfo {
 			preimage: None,
-			secret: Some(invoice.payment_secret().clone()),
+			secret: Some(*invoice.payment_secret()),
 			status: HTLCStatus::Pending,
 			amt_msat: MillisatAmount(Some(amt_msat)),
 		},
@@ -994,24 +996,21 @@ pub(crate) fn parse_peer_info(
 	let pubkey = pubkey_and_addr.next();
 	let peer_addr_str = pubkey_and_addr.next();
 	if peer_addr_str.is_none() {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::Other,
+		return Err(std::io::Error::other(
 			"ERROR: incorrectly formatted peer info. Should be formatted as: `pubkey@host:port`",
 		));
 	}
 
 	let peer_addr = peer_addr_str.unwrap().to_socket_addrs().map(|mut r| r.next());
 	if peer_addr.is_err() || peer_addr.as_ref().unwrap().is_none() {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::Other,
+		return Err(std::io::Error::other(
 			"ERROR: couldn't parse pubkey@host:port into a socket address",
 		));
 	}
 
 	let pubkey = hex_utils::to_compressed_pubkey(pubkey.unwrap());
 	if pubkey.is_none() {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::Other,
+		return Err(std::io::Error::other(
 			"ERROR: unable to parse given pubkey for node",
 		));
 	}

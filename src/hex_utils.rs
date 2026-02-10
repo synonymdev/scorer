@@ -35,12 +35,6 @@ pub fn to_compressed_pubkey(hex: &str) -> Option<PublicKey> {
 	if hex.len() != 33 * 2 {
 		return None;
 	}
-	let data = match to_vec(&hex[0..33 * 2]) {
-		Some(bytes) => bytes,
-		None => return None,
-	};
-	match PublicKey::from_slice(&data) {
-		Ok(pk) => Some(pk),
-		Err(_) => None,
-	}
+	let data = to_vec(&hex[0..33 * 2])?;
+	PublicKey::from_slice(&data).ok()
 }

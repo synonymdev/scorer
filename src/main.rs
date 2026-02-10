@@ -44,6 +44,7 @@ use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::util::config::UserConfig;
 use lightning::util::hash_tables::hash_map::Entry;
 use lightning::util::hash_tables::HashMap;
+use lightning::util::logger::Logger;
 use lightning::util::persist::{
 	self, KVStore, MonitorUpdatingPersisterAsync, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -58,6 +59,7 @@ use lightning_dns_resolver::OMDomainResolver;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::{thread_rng, Rng};
+use serde::Deserialize;
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
 use std::fmt;
@@ -75,6 +77,49 @@ pub(crate) enum HTLCStatus {
 	Pending,
 	Succeeded,
 	Failed,
+}
+
+#[derive(Deserialize)]
+struct ProbeConfig {
+	probe_interval_sec: u64,
+	probe_peers: Vec<String>,
+	probe_amount_msats: Vec<u64>,
+	#[serde(default = "default_probe_timeout_sec")]
+	probe_timeout_sec: u64,
+}
+
+fn default_probe_timeout_sec() -> u64 {
+	60
+}
+
+#[derive(Clone, Debug)]
+enum ProbeOutcome {
+	Success,
+	Failed,
+}
+
+struct ProbeTracker {
+	pending_probes: StdHashMap<PaymentHash, tokio::sync::oneshot::Sender<ProbeOutcome>>,
+}
+
+impl ProbeTracker {
+	fn new() -> Self {
+		Self { pending_probes: StdHashMap::new() }
+	}
+
+	fn register_probe(
+		&mut self, payment_hash: PaymentHash,
+	) -> tokio::sync::oneshot::Receiver<ProbeOutcome> {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.pending_probes.insert(payment_hash, tx);
+		rx
+	}
+
+	fn complete_probe(&mut self, payment_hash: &PaymentHash, outcome: ProbeOutcome) {
+		if let Some(sender) = self.pending_probes.remove(payment_hash) {
+			let _ = sender.send(outcome);
+		}
+	}
 }
 
 impl_writeable_tlv_based_enum!(HTLCStatus,
@@ -213,32 +258,36 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
 // Needed due to rust-lang/rust#63033.
 struct OutputSweeperWrapper(Arc<OutputSweeper>);
 
-fn send_rand_probe(
+fn truncate_pubkey(pubkey: &str) -> String {
+	if pubkey.len() > 12 {
+		format!("{}...", &pubkey[..12])
+	} else {
+		pubkey.to_string()
+	}
+}
+
+fn prepare_probe(
 	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &disk::FilesystemLogger,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
-) {
-	let rcpt = {
-		let lck = graph.read_only();
-		if lck.nodes().is_empty() {
-			return;
-		}
-		let mut it =
-			lck.nodes().unordered_iter().skip(::rand::random::<usize>() % lck.nodes().len());
-		it.next().unwrap().0.clone()
-	};
-	let amt = ::rand::random::<u64>() % 500_000_000;
-	if let Ok(pk) = bitcoin::secp256k1::PublicKey::from_slice(rcpt.as_slice()) {
-		send_probe(channel_manager, pk, graph, logger, amt, scorer);
+	pub_key_hex: &str, probe_amount: u64,
+) -> Option<PaymentHash> {
+	if probe_amount == 0 {
+		return None;
 	}
+	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)?;
+	if let Ok(pk) = bitcoin::secp256k1::PublicKey::from_slice(&pub_key_bytes) {
+		return send_probe(channel_manager, pk, graph, logger, probe_amount, scorer);
+	}
+	None
 }
 
 fn send_probe(
 	channel_manager: &ChannelManager, recipient: PublicKey, graph: &NetworkGraph,
 	logger: &disk::FilesystemLogger, amt_msat: u64,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
-) {
+) -> Option<PaymentHash> {
 	let chans = channel_manager.list_usable_channels();
-	let chan_refs = chans.iter().map(|a| a).collect::<Vec<_>>();
+	let chan_refs = chans.iter().collect::<Vec<_>>();
 	let mut payment_params = PaymentParameters::from_node_id(recipient, 144);
 	payment_params.max_path_count = 1;
 	let in_flight_htlcs = channel_manager.compute_inflight_htlcs();
@@ -248,7 +297,7 @@ fn send_probe(
 	let route_res = lightning::routing::router::find_route(
 		&channel_manager.get_our_node_id(),
 		&RouteParameters::from_payment_params_and_value(payment_params, amt_msat),
-		&graph,
+		graph,
 		Some(&chan_refs),
 		logger,
 		&inflight_scorer,
@@ -256,10 +305,21 @@ fn send_probe(
 		&[32; 32],
 	);
 	if let Ok(route) = route_res {
-		for path in route.paths {
-			let _ = channel_manager.send_probe(path);
+		// We only send one probe per call (max_path_count = 1), so take the first path
+		if let Some(path) = route.paths.into_iter().next() {
+			if let Ok((payment_hash, _)) = channel_manager.send_probe(path) {
+				return Some(payment_hash);
+			}
 		}
 	}
+	None
+}
+
+fn read_probe_file(ldk_data_dir: &str) -> Result<ProbeConfig, std::io::Error> {
+	let prober_file = format!("{}/prober_config.json", ldk_data_dir);
+	let file = fs::read_to_string(prober_file)?;
+	let config: ProbeConfig = serde_json::from_str(&file).map_err(std::io::Error::other)?;
+	Ok(config)
 }
 
 fn handle_ldk_events<'a>(
@@ -268,7 +328,8 @@ fn handle_ldk_events<'a>(
 	bump_tx_event_handler: &'a BumpTxEventHandler, peer_manager: Arc<PeerManager>,
 	inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
 	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
-	output_sweeper: OutputSweeperWrapper, network: Network, event: Event,
+	output_sweeper: OutputSweeperWrapper, network: Network,
+	probe_tracker: Arc<Mutex<ProbeTracker>>, event: Event,
 ) -> impl core::future::Future<Output = ()> + 'a {
 	async move {
 		match event {
@@ -282,12 +343,13 @@ fn handle_ldk_events<'a>(
 				// Construct the raw transaction with one output, that is paid the amount of the
 				// channel.
 				let addr = WitnessProgram::from_scriptpubkey(
-					&output_script.as_bytes(),
+					output_script.as_bytes(),
 					match network {
 						Network::Bitcoin => bitcoin_bech32::constants::Network::Bitcoin,
 						Network::Regtest => bitcoin_bech32::constants::Network::Regtest,
 						Network::Signet => bitcoin_bech32::constants::Network::Signet,
-						Network::Testnet | _ => bitcoin_bech32::constants::Network::Testnet,
+						Network::Testnet => bitcoin_bech32::constants::Network::Testnet,
+						_ => bitcoin_bech32::constants::Network::Testnet,
 					},
 				)
 				.expect("Lightning funding tx should always be to a SegWit output")
@@ -303,7 +365,7 @@ fn handle_ldk_events<'a>(
 				// Sign the final funding transaction and give it to LDK, who will eventually broadcast it.
 				let signed_tx =
 					bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await;
-				assert_eq!(signed_tx.complete, true);
+				assert!(signed_tx.complete);
 				let final_tx: Transaction =
 					encode::deserialize(&hex_utils::to_vec(&signed_tx.hex).unwrap()).unwrap();
 				// Give the funding transaction back to LDK for opening the channel.
@@ -455,8 +517,12 @@ fn handle_ldk_events<'a>(
 			},
 			Event::PaymentPathSuccessful { .. } => {},
 			Event::PaymentPathFailed { .. } => {},
-			Event::ProbeSuccessful { .. } => {},
-			Event::ProbeFailed { .. } => {},
+			Event::ProbeSuccessful { payment_hash, .. } => {
+				probe_tracker.lock().unwrap().complete_probe(&payment_hash, ProbeOutcome::Success);
+			},
+			Event::ProbeFailed { payment_hash, .. } => {
+				probe_tracker.lock().unwrap().complete_probe(&payment_hash, ProbeOutcome::Failed);
+			},
 			Event::PaymentFailed { payment_hash, reason, payment_id, .. } => {
 				if let Some(hash) = payment_hash {
 					print!(
@@ -672,7 +738,8 @@ async fn start_ldk() {
 			bitcoin::Network::Bitcoin => "main",
 			bitcoin::Network::Regtest => "regtest",
 			bitcoin::Network::Signet => "signet",
-			bitcoin::Network::Testnet | _ => "test",
+			bitcoin::Network::Testnet => "test",
+			_ => "test",
 		} {
 		println!(
 			"Chain argument ({}) didn't match bitcoind chain ({})",
@@ -1038,11 +1105,11 @@ async fn start_ldk() {
 	let recent_payments_payment_ids = channel_manager
 		.list_recent_payments()
 		.into_iter()
-		.filter_map(|p| match p {
-			RecentPaymentDetails::Pending { payment_id, .. } => Some(payment_id),
-			RecentPaymentDetails::Fulfilled { payment_id, .. } => Some(payment_id),
-			RecentPaymentDetails::Abandoned { payment_id, .. } => Some(payment_id),
-			RecentPaymentDetails::AwaitingInvoice { payment_id } => Some(payment_id),
+		.map(|p| match p {
+			RecentPaymentDetails::Pending { payment_id, .. } => payment_id,
+			RecentPaymentDetails::Fulfilled { payment_id, .. } => payment_id,
+			RecentPaymentDetails::Abandoned { payment_id, .. } => payment_id,
+			RecentPaymentDetails::AwaitingInvoice { payment_id } => payment_id,
 		})
 		.collect::<Vec<PaymentId>>();
 	for (payment_id, payment_info) in outbound_payments
@@ -1071,6 +1138,8 @@ async fn start_ldk() {
 	let fs_store_event_listener = Arc::clone(&fs_store);
 	let peer_manager_event_listener = Arc::clone(&peer_manager);
 	let output_sweeper_event_listener = Arc::clone(&output_sweeper);
+	let probe_tracker = Arc::new(Mutex::new(ProbeTracker::new()));
+	let probe_tracker_event_listener = Arc::clone(&probe_tracker);
 	let network = args.network;
 	let event_handler = move |event: Event| {
 		let channel_manager_event_listener = Arc::clone(&channel_manager_event_listener);
@@ -1083,6 +1152,7 @@ async fn start_ldk() {
 		let fs_store_event_listener = Arc::clone(&fs_store_event_listener);
 		let peer_manager_event_listener = Arc::clone(&peer_manager_event_listener);
 		let output_sweeper_event_listener = Arc::clone(&output_sweeper_event_listener);
+		let probe_tracker_event_listener = Arc::clone(&probe_tracker_event_listener);
 		async move {
 			handle_ldk_events(
 				channel_manager_event_listener,
@@ -1096,6 +1166,7 @@ async fn start_ldk() {
 				fs_store_event_listener,
 				OutputSweeperWrapper(output_sweeper_event_listener),
 				network,
+				probe_tracker_event_listener,
 				event,
 			)
 			.await;
@@ -1152,9 +1223,9 @@ async fn start_ldk() {
 				let id = NodeId::from_pubkey(&node_id);
 				let addrs = if let Some(node) = graph_connect.read_only().node(&id) {
 					if let Some(ann) = &node.announcement_info {
-						let non_onion = |addr| match addr {
-							&lightning::ln::msgs::SocketAddress::OnionV2(_) => None,
-							&lightning::ln::msgs::SocketAddress::OnionV3 { .. } => None,
+						let non_onion = |addr: &lightning::ln::msgs::SocketAddress| match addr {
+							lightning::ln::msgs::SocketAddress::OnionV2(_) => None,
+							lightning::ln::msgs::SocketAddress::OnionV3 { .. } => None,
 							_ => Some(addr.clone()),
 						};
 						ann.addresses().iter().filter_map(non_onion).collect::<Vec<_>>()
@@ -1216,13 +1287,136 @@ async fn start_ldk() {
 	let probing_graph = Arc::clone(&network_graph);
 	let probing_logger = Arc::clone(&logger);
 	let probing_scorer = Arc::clone(&scorer);
-	tokio::spawn(async move {
-		let mut interval = tokio::time::interval(Duration::from_secs(1));
-		loop {
-			interval.tick().await;
-			send_rand_probe(&*probing_cm, &*probing_graph, &*probing_logger, &*probing_scorer);
-		}
-	});
+	let probing_tracker = Arc::clone(&probe_tracker);
+	match read_probe_file(&ldk_data_dir) {
+		Ok(probe_config) => {
+			if probe_config.probe_peers.is_empty() {
+				println!("WARNING: prober_config.json has no probe_peers. Probing disabled.");
+			} else if probe_config.probe_amount_msats.is_empty() {
+				println!(
+					"WARNING: prober_config.json has no probe_amount_msats. Probing disabled."
+				);
+			} else {
+				// Sort amounts ascending (smallest to largest)
+				let mut sorted_amounts = probe_config.probe_amount_msats.clone();
+				sorted_amounts.sort();
+
+				let probe_timeout = Duration::from_secs(probe_config.probe_timeout_sec);
+
+				// Log startup configuration
+				lightning::log_info!(
+					&*probing_logger,
+					"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s",
+					probe_config.probe_peers.len(),
+					sorted_amounts.len(),
+					sorted_amounts,
+					probe_config.probe_interval_sec,
+					probe_config.probe_timeout_sec
+				);
+
+				tokio::spawn(async move {
+					let mut interval =
+						tokio::time::interval(Duration::from_secs(probe_config.probe_interval_sec));
+					loop {
+						interval.tick().await;
+
+						// Probe each peer with amounts from smallest to largest
+						for peer in &probe_config.probe_peers {
+							let peer_short = truncate_pubkey(peer);
+							'amounts: for &amount in &sorted_amounts {
+								// Send the probe and get the payment hash
+								let payment_hash = prepare_probe(
+									&probing_cm,
+									&probing_graph,
+									&probing_logger,
+									&probing_scorer,
+									peer,
+									amount,
+								);
+
+								if let Some(hash) = payment_hash {
+									lightning::log_info!(
+										&*probing_logger,
+										"Probe SENT to {} for {} msat (hash: {})",
+										peer_short,
+										amount,
+										hash
+									);
+
+									// Register the probe and get a receiver for the outcome
+									let rx = probing_tracker.lock().unwrap().register_probe(hash);
+
+									// Wait for the probe outcome with timeout
+									let outcome = tokio::time::timeout(probe_timeout, rx).await;
+
+									match outcome {
+										Ok(Ok(ProbeOutcome::Success)) => {
+											lightning::log_info!(
+												&*probing_logger,
+												"Probe SUCCESS to {} for {} msat (hash: {})",
+												peer_short,
+												amount,
+												hash
+											);
+											// Probe succeeded, continue to next amount
+										},
+										Ok(Ok(ProbeOutcome::Failed)) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_short,
+												amount,
+												hash
+											);
+											break 'amounts;
+										},
+										Ok(Err(_)) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
+												peer_short,
+												amount,
+												hash
+											);
+											break 'amounts;
+										},
+										Err(_) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_short,
+												amount,
+												hash
+											);
+											// Clean up the pending probe to avoid memory leak
+											probing_tracker
+												.lock()
+												.unwrap()
+												.pending_probes
+												.remove(&hash);
+											break 'amounts;
+										},
+									}
+								} else {
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
+										peer_short,
+										amount
+									);
+									break 'amounts;
+								}
+							}
+						}
+					}
+				});
+			}
+		},
+		Err(_) => println!(
+			"WARNING: prober_config.json at {}/prober_config.json is missing or malformed. Probing disabled.",
+			ldk_data_dir
+		),
+	};
 
 	// Start the CLI.
 	let cli_channel_manager = Arc::clone(&channel_manager);
@@ -1256,7 +1450,7 @@ async fn start_ldk() {
 	peer_manager.disconnect_all_peers();
 
 	if let Err(e) = bg_res {
-		let persist_res = fs_store
+		fs_store
 			.write(
 				persist::CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 				persist::CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -1266,15 +1460,11 @@ async fn start_ldk() {
 			.await
 			.unwrap();
 		use lightning::util::logger::Logger;
-		lightning::log_error!(
-			&*logger,
-			"Last-ditch ChannelManager persistence result: {:?}",
-			persist_res
-		);
+		lightning::log_error!(&*logger, "Last-ditch ChannelManager persistence completed");
 		panic!(
 			"ERR: background processing stopped with result {:?}, exiting.\n\
-			Last-ditch ChannelManager persistence result {:?}",
-			e, persist_res
+			Last-ditch ChannelManager persistence completed",
+			e
 		);
 	}
 

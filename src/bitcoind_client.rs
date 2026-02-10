@@ -59,7 +59,7 @@ impl BlockSource for BitcoindClient {
 		Box::pin(async move { self.bitcoind_rpc_client.get_block(header_hash).await })
 	}
 
-	fn get_best_block<'a>(&'a self) -> AsyncBlockSourceResult<(BlockHash, Option<u32>)> {
+	fn get_best_block(&self) -> AsyncBlockSourceResult<'_, (BlockHash, Option<u32>)> {
 		Box::pin(async move { self.bitcoind_rpc_client.get_best_block().await })
 	}
 }
@@ -77,7 +77,7 @@ impl BitcoindClient {
 			base64::encode(format!("{}:{}", rpc_user.clone(), rpc_password.clone()));
 		let bitcoind_rpc_client = RpcClient::new(&rpc_credentials, http_endpoint);
 		let _dummy = bitcoind_rpc_client
-			.call_method::<BlockchainInfo>("getblockchaininfo", &vec![])
+			.call_method::<BlockchainInfo>("getblockchaininfo", &[])
 			.await
 			.map_err(|_| {
 				std::io::Error::new(std::io::ErrorKind::PermissionDenied,
@@ -126,7 +126,7 @@ impl BitcoindClient {
 			loop {
 				let mempoolmin_estimate = {
 					let resp = rpc_client
-						.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &vec![])
+						.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
 						.await
 						.unwrap();
 					match resp.feerate_sat_per_kw {
@@ -140,7 +140,7 @@ impl BitcoindClient {
 					let resp = rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
-							&vec![background_conf_target, background_estimate_mode],
+							&[background_conf_target, background_estimate_mode],
 						)
 						.await
 						.unwrap();
@@ -156,7 +156,7 @@ impl BitcoindClient {
 					let resp = rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
-							&vec![normal_conf_target, normal_estimate_mode],
+							&[normal_conf_target, normal_estimate_mode],
 						)
 						.await
 						.unwrap();
@@ -172,7 +172,7 @@ impl BitcoindClient {
 					let resp = rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
-							&vec![high_prio_conf_target, high_prio_estimate_mode],
+							&[high_prio_conf_target, high_prio_estimate_mode],
 						)
 						.await
 						.unwrap();
@@ -189,7 +189,7 @@ impl BitcoindClient {
 					let resp = rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
-							&vec![high_prio_conf_target, high_prio_estimate_mode],
+							&[high_prio_conf_target, high_prio_estimate_mode],
 						)
 						.await
 						.unwrap();
@@ -241,7 +241,7 @@ impl BitcoindClient {
 		self.bitcoind_rpc_client
 			.call_method::<RawTx>(
 				"createrawtransaction",
-				&vec![serde_json::json!([]), outputs_json],
+				&[serde_json::json!([]), outputs_json],
 			)
 			.await
 			.unwrap()
@@ -283,14 +283,14 @@ impl BitcoindClient {
 		let rpc_client = self.get_new_rpc_client();
 		async move {
 			rpc_client
-				.call_method("signrawtransactionwithwallet", &vec![tx_hex_json])
+				.call_method("signrawtransactionwithwallet", &[tx_hex_json])
 				.await
 				.unwrap()
 		}
 	}
 
 	pub fn get_new_address(&self) -> impl Future<Output = Address> {
-		let addr_args = vec![serde_json::json!("LDK output address")];
+		let addr_args = [serde_json::json!("LDK output address")];
 		let network = self.network;
 		let rpc_client = self.get_new_rpc_client();
 		async move {
@@ -302,7 +302,7 @@ impl BitcoindClient {
 
 	pub async fn get_blockchain_info(&self) -> BlockchainInfo {
 		self.bitcoind_rpc_client
-			.call_method::<BlockchainInfo>("getblockchaininfo", &vec![])
+			.call_method::<BlockchainInfo>("getblockchaininfo", &[])
 			.await
 			.unwrap()
 	}
@@ -310,7 +310,7 @@ impl BitcoindClient {
 	pub fn list_unspent(&self) -> impl Future<Output = ListUnspentResponse> {
 		let rpc_client = self.get_new_rpc_client();
 		async move {
-			rpc_client.call_method::<ListUnspentResponse>("listunspent", &vec![]).await.unwrap()
+			rpc_client.call_method::<ListUnspentResponse>("listunspent", &[]).await.unwrap()
 		}
 	}
 }
@@ -330,7 +330,7 @@ impl BroadcasterInterface for BitcoindClient {
 		// however, so we just use it unconditionally here.
 		// Sadly, Bitcoin Core has an arbitrary restriction on `submitpackage` - it must actually
 		// contain a package (see https://github.com/bitcoin/bitcoin/issues/31085).
-		let txn = txs.iter().map(|tx| encode::serialize_hex(tx)).collect::<Vec<_>>();
+		let txn = txs.iter().map(encode::serialize_hex).collect::<Vec<_>>();
 		let bitcoind_rpc_client = Arc::clone(&self.bitcoind_rpc_client);
 		let logger = Arc::clone(&self.logger);
 		self.main_runtime_handle.spawn(async move {
@@ -392,8 +392,8 @@ impl WalletSource for BitcoindClient {
 										value,
 										script_pubkey: utxo.address.script_pubkey(),
 									},
-									satisfaction_weight: 1 /* empty script_sig */ * WITNESS_SCALE_FACTOR as u64 +
-										1 /* witness items */ + 1 /* schnorr sig len */ + 64, /* schnorr sig */
+								satisfaction_weight: WITNESS_SCALE_FACTOR as u64 +
+									1 /* witness items */ + 1 /* schnorr sig len */ + 64, /* schnorr sig */
 								})
 								.ok()
 						},

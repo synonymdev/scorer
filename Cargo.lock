@@ -383,6 +383,7 @@ dependencies = [
  "lightning-persister",
  "lightning-rapid-gossip-sync",
  "rand",
+ "serde",
  "serde_json",
  "tokio",
 ]

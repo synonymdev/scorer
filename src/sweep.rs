@@ -14,7 +14,7 @@ use crate::disk::FilesystemLogger;
 use crate::hex_utils;
 use crate::OutputSweeper;
 
-const DEPRECATED_PENDING_SPENDABLE_OUTPUT_DIR: &'static str = "pending_spendable_outputs";
+const DEPRECATED_PENDING_SPENDABLE_OUTPUT_DIR: &str = "pending_spendable_outputs";
 
 /// We updated to use LDK's OutputSweeper as part of upgrading to LDK 0.0.123, so migrate away from
 /// the old sweep persistence.
@@ -47,7 +47,7 @@ pub(crate) async fn migrate_deprecated_spendable_outputs(
 				fs::create_dir_all(&processing_spendables_dir).unwrap();
 				let mut holding_path = PathBuf::new();
 				holding_path.push(&processing_spendables_dir);
-				holding_path.push(&file.file_name());
+				holding_path.push(file.file_name());
 				fs::rename(file.path(), holding_path).unwrap();
 			}
 		}
@@ -83,7 +83,7 @@ pub(crate) async fn migrate_deprecated_spendable_outputs(
 						reader.seek(SeekFrom::Current(-1)).unwrap();
 					},
 					Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-					Err(e) => Err(e).unwrap(),
+					Err(e) => panic!("{:?}", e),
 				}
 				outputs.push(Readable::read(&mut reader).unwrap());
 			}
