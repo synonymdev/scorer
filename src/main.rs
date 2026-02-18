@@ -4,6 +4,7 @@ mod cli;
 mod convert;
 mod disk;
 mod hex_utils;
+mod rapid_sync;
 mod sweep;
 
 use crate::bitcoind_client::BitcoindClient;
@@ -998,7 +999,40 @@ async fn start_ldk() {
 		);
 	}
 
-	// Step 15: Optional: Initialize the P2PGossipSync
+	// Step 15: Initialize RapidGossipSync if enabled
+	let rapid_sync_manager = if args.rapid_gossip_sync_enabled {
+		lightning::log_info!(
+			&*logger,
+			"Initializing RapidGossipSync with URL: {}",
+			args.rapid_gossip_sync_url.as_ref().unwrap_or(&"default".to_string())
+		);
+		
+		match rapid_sync::RapidGossipSyncManager::new(
+			Arc::clone(&network_graph),
+			args.rapid_gossip_sync_url.clone(),
+			Arc::clone(&fs_store),
+			Arc::clone(&logger),
+			ldk_data_dir.clone(),
+		).await {
+			Ok(manager) => {
+				lightning::log_info!(&*logger, "RapidGossipSync initialized successfully");
+				Some(Arc::new(tokio::sync::Mutex::new(manager)))
+			},
+			Err(e) => {
+				lightning::log_error!(
+					&*logger,
+					"Failed to initialize RapidGossipSync: {:?}. Continuing with P2P sync only.",
+					e
+				);
+				None
+			}
+		}
+	} else {
+		lightning::log_info!(&*logger, "RapidGossipSync disabled by configuration");
+		None
+	};
+
+	// Step 15.5: Initialize the P2PGossipSync
 	let gossip_sync =
 		Arc::new(P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger)));
 
@@ -1249,6 +1283,9 @@ async fn start_ldk() {
 		}
 	});
 
+	// Capture rapid sync interval before moving args
+	let rapid_gossip_sync_interval_hours = args.rapid_gossip_sync_interval_hours;
+
 	// Regularly broadcast our node_announcement. This is only required (or possible) if we have
 	// some public channels.
 	let peer_man = Arc::clone(&peer_manager);
@@ -1417,6 +1454,47 @@ async fn start_ldk() {
 			ldk_data_dir
 		),
 	};
+
+	// Start periodic rapid gossip sync updates
+	if let Some(rapid_sync) = rapid_sync_manager {
+		let rapid_sync_interval = Duration::from_secs(rapid_gossip_sync_interval_hours * 3600);
+		let rapid_sync_logger = Arc::clone(&logger);
+		
+		tokio::spawn(async move {
+			let mut interval = tokio::time::interval(rapid_sync_interval);
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			
+			// Skip the first tick since we just synced on startup
+			interval.tick().await;
+			
+			loop {
+				interval.tick().await;
+				
+				lightning::log_info!(
+					&*rapid_sync_logger,
+					"Starting periodic rapid gossip sync update"
+				);
+				
+				let mut sync_manager = rapid_sync.lock().await;
+				match sync_manager.sync_network_graph().await {
+					Ok(new_timestamp) => {
+						lightning::log_info!(
+							&*rapid_sync_logger,
+							"Periodic rapid gossip sync completed successfully. New timestamp: {}",
+							new_timestamp
+						);
+					},
+					Err(e) => {
+						lightning::log_error!(
+							&*rapid_sync_logger,
+							"Periodic rapid gossip sync failed: {:?}",
+							e
+						);
+					}
+				}
+			}
+		});
+	}
 
 	// Start the CLI.
 	let cli_channel_manager = Arc::clone(&channel_manager);

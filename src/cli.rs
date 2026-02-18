@@ -45,6 +45,9 @@ pub(crate) struct LdkUserInfo {
 	pub(crate) ldk_announced_listen_addr: Vec<SocketAddress>,
 	pub(crate) ldk_announced_node_name: [u8; 32],
 	pub(crate) network: Network,
+	pub(crate) rapid_gossip_sync_enabled: bool,
+	pub(crate) rapid_gossip_sync_url: Option<String>,
+	pub(crate) rapid_gossip_sync_interval_hours: u64,
 }
 
 pub(crate) async fn poll_for_user_input(

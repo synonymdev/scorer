@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 	if env::args().len() < 3 {
-		println!("ldk-tutorial-node requires at least 2 arguments: `cargo run [<bitcoind-rpc-username>:<bitcoind-rpc-password>@]<bitcoind-rpc-host>:<bitcoind-rpc-port> ldk_storage_directory_path [<ldk-incoming-peer-listening-port>] [bitcoin-network] [announced-node-name announced-listen-addr*]`");
+		println!("ldk-tutorial-node requires at least 2 arguments: `cargo run [<bitcoind-rpc-username>:<bitcoind-rpc-password>@]<bitcoind-rpc-host>:<bitcoind-rpc-port> ldk_storage_directory_path [<ldk-incoming-peer-listening-port>] [bitcoin-network] [announced-node-name announced-listen-addr*] [--rapid-gossip-sync-url <URL>] [--rapid-gossip-sync-interval <HOURS>] [--disable-rapid-gossip-sync]`");
 		return Err(());
 	}
 	let bitcoind_rpc_info = env::args().nth(1).unwrap();
@@ -94,6 +94,52 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		}
 	}
 
+	// Parse rapid gossip sync options
+	let mut rapid_gossip_sync_enabled = true;
+	let mut rapid_gossip_sync_url = None;
+	let mut rapid_gossip_sync_interval_hours = 6;
+
+	// Check for rapid gossip sync arguments
+	let mut i = arg_idx + 1;
+	while let Some(arg) = env::args().nth(i) {
+		match arg.as_str() {
+			"--disable-rapid-gossip-sync" => {
+				rapid_gossip_sync_enabled = false;
+				i += 1;
+			},
+			"--rapid-gossip-sync-url" => {
+				if let Some(url) = env::args().nth(i + 1) {
+					rapid_gossip_sync_url = Some(url);
+					i += 2;
+				} else {
+					println!("ERROR: --rapid-gossip-sync-url requires a URL argument");
+					return Err(());
+				}
+			},
+			"--rapid-gossip-sync-interval" => {
+				if let Some(hours_str) = env::args().nth(i + 1) {
+					match hours_str.parse::<u64>() {
+						Ok(hours) => {
+							rapid_gossip_sync_interval_hours = hours;
+							i += 2;
+						},
+						Err(_) => {
+							println!("ERROR: --rapid-gossip-sync-interval requires a numeric argument (hours)");
+							return Err(());
+						},
+					}
+				} else {
+					println!("ERROR: --rapid-gossip-sync-interval requires a numeric argument");
+					return Err(());
+				}
+			},
+			_ => {
+				// Unknown argument, might be for something else
+				break;
+			},
+		}
+	}
+
 	Ok(LdkUserInfo {
 		bitcoind_rpc_username,
 		bitcoind_rpc_password,
@@ -104,6 +150,9 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		ldk_announced_listen_addr,
 		ldk_announced_node_name,
 		network,
+		rapid_gossip_sync_enabled,
+		rapid_gossip_sync_url,
+		rapid_gossip_sync_interval_hours,
 	})
 }
 
