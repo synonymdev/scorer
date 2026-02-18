@@ -35,6 +35,15 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+/// Probing configuration passed from config.json
+#[derive(Clone)]
+pub(crate) struct ProbingConfig {
+	pub(crate) interval_sec: u64,
+	pub(crate) peers: Vec<String>,
+	pub(crate) amount_msats: Vec<u64>,
+	pub(crate) timeout_sec: u64,
+}
+
 pub(crate) struct LdkUserInfo {
 	pub(crate) bitcoind_rpc_username: String,
 	pub(crate) bitcoind_rpc_password: String,
@@ -48,6 +57,7 @@ pub(crate) struct LdkUserInfo {
 	pub(crate) rapid_gossip_sync_enabled: bool,
 	pub(crate) rapid_gossip_sync_url: Option<String>,
 	pub(crate) rapid_gossip_sync_interval_hours: u64,
+	pub(crate) probing: Option<ProbingConfig>,
 }
 
 pub(crate) async fn poll_for_user_input(

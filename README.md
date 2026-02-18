@@ -9,30 +9,76 @@ git clone https://github.com/lightningdevkit/ldk-sample
 ## Usage
 ```
 cd ldk-sample
-cargo run <bitcoind-rpc-username>:<bitcoind-rpc-password>@<bitcoind-rpc-host>:<bitcoind-rpc-port> <ldk_storage_directory_path> [<ldk-peer-listening-port>] [<bitcoin-network>] [<announced-node-name>] [<announced-listen-addr>]
+cargo run <ldk_storage_directory_path>
 ```
-`bitcoind`'s RPC username and password likely can be found through `cat ~/.bitcoin/.cookie`.
+The only CLI argument is the storage directory path. All configuration is read from
+`<ldk_storage_directory_path>/.ldk/config.json`.
 
-`bitcoin-network`: defaults to `testnet`. Options: `testnet`, `regtest`, and `signet`.
+Use `config.example.json` in the repo root as a template for your config file.
 
-`ldk-peer-listening-port`: defaults to 9735.
+## Configuration
 
-`announced-listen-addr` and `announced-node-name`: default to nothing, disabling any public announcements of this node.
-`announced-listen-addr` can be set to an IPv4 or IPv6 address to announce that as a publicly-connectable address for this node.
-`announced-node-name` can be any string up to 32 bytes in length, representing this node's alias.
+Config is loaded from `<storage_dir>/.ldk/config.json` and strictly validated. Unknown
+fields cause an error (`deny_unknown_fields`).
 
-## Probe Config
-Targeted probing is disabled unless a config file exists.
+Required sections: `bitcoind`.
+Optional sections: `ldk`, `rapid_gossip_sync`, and `probing` (probing is disabled if
+missing).
 
+Network options: `mainnet`, `testnet`, `regtest`, `signet` (default is `testnet`).
+
+### Example config
+
+```json
+{
+  "bitcoind": {
+    "rpc_host": "127.0.0.1",
+    "rpc_port": 8332,
+    "rpc_username": "your_rpc_user",
+    "rpc_password": "your_rpc_password"
+  },
+  "network": "testnet",
+  "ldk": {
+    "peer_listening_port": 9735,
+    "announced_node_name": "MyLDKNode",
+    "announced_listen_addr": []
+  },
+  "rapid_gossip_sync": {
+    "enabled": true,
+    "url": "https://rapidsync.lightningdevkit.org/snapshot/",
+    "interval_hours": 6
+  },
+  "probing": {
+    "interval_sec": 300,
+    "peers": ["02abc123...@1.2.3.4:9735"],
+    "amount_msats": [1000, 10000, 100000, 1000000],
+    "timeout_sec": 60
+  }
+}
 ```
-cp ./prober_config.json.example <ldk data dir>/prober_config.json
-```
 
-`probe_peers` pubkey of peers you are probing.
+### Key options
 
-`probe_interval_sec` how often to probe, in seconds.
+`bitcoind`:
+RPC details are required. `rpc_username` and `rpc_password` can usually be found
+via `cat ~/.bitcoin/.cookie`.
 
-`max_amount_msats` maximum amount to probe, in millisatoshis.
+`ldk`:
+`peer_listening_port` defaults to 9735. `announced_listen_addr` and
+`announced_node_name` default to empty, disabling public announcements.
+`announced_listen_addr` can be set to an IPv4 or IPv6 address to announce a
+publicly-connectable address. `announced_node_name` can be any string up to 32
+bytes, representing this node's alias.
+
+`rapid_gossip_sync`:
+Enabled by default to speed up initial network graph sync. On startup, the node
+attempts a RapidGossipSync download up to 3 times with exponential backoff. If it
+fails, the node falls back to P2P gossip sync. `url` defaults to
+`https://rapidsync.lightningdevkit.org/snapshot/`, `interval_hours` defaults to 6.
+
+`probing`:
+Optional. If omitted, probing is disabled. Configure probe interval, peers, probe
+amounts in millisatoshis, and timeout.
 
 ## License
 

@@ -1,5 +1,6 @@
 mod args;
 pub mod bitcoind_client;
+mod config;
 mod cli;
 mod convert;
 mod disk;
@@ -60,7 +61,6 @@ use lightning_dns_resolver::OMDomainResolver;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::{thread_rng, Rng};
-use serde::Deserialize;
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
 use std::fmt;
@@ -78,19 +78,6 @@ pub(crate) enum HTLCStatus {
 	Pending,
 	Succeeded,
 	Failed,
-}
-
-#[derive(Deserialize)]
-struct ProbeConfig {
-	probe_interval_sec: u64,
-	probe_peers: Vec<String>,
-	probe_amount_msats: Vec<u64>,
-	#[serde(default = "default_probe_timeout_sec")]
-	probe_timeout_sec: u64,
-}
-
-fn default_probe_timeout_sec() -> u64 {
-	60
 }
 
 #[derive(Clone, Debug)]
@@ -314,13 +301,6 @@ fn send_probe(
 		}
 	}
 	None
-}
-
-fn read_probe_file(ldk_data_dir: &str) -> Result<ProbeConfig, std::io::Error> {
-	let prober_file = format!("{}/prober_config.json", ldk_data_dir);
-	let file = fs::read_to_string(prober_file)?;
-	let config: ProbeConfig = serde_json::from_str(&file).map_err(std::io::Error::other)?;
-	Ok(config)
 }
 
 fn handle_ldk_events<'a>(
@@ -1283,8 +1263,9 @@ async fn start_ldk() {
 		}
 	});
 
-	// Capture rapid sync interval before moving args
+	// Capture values before moving args
 	let rapid_gossip_sync_interval_hours = args.rapid_gossip_sync_interval_hours;
+	let probing_config = args.probing.clone();
 
 	// Regularly broadcast our node_announcement. This is only required (or possible) if we have
 	// some public channels.
@@ -1319,141 +1300,133 @@ async fn start_ldk() {
 		Arc::clone(&output_sweeper),
 	));
 
-	// Regularly probe
+	// Regularly probe (if probing config is present)
 	let probing_cm = Arc::clone(&channel_manager);
 	let probing_graph = Arc::clone(&network_graph);
 	let probing_logger = Arc::clone(&logger);
 	let probing_scorer = Arc::clone(&scorer);
 	let probing_tracker = Arc::clone(&probe_tracker);
-	match read_probe_file(&ldk_data_dir) {
-		Ok(probe_config) => {
-			if probe_config.probe_peers.is_empty() {
-				println!("WARNING: prober_config.json has no probe_peers. Probing disabled.");
-			} else if probe_config.probe_amount_msats.is_empty() {
-				println!(
-					"WARNING: prober_config.json has no probe_amount_msats. Probing disabled."
-				);
-			} else {
-				// Sort amounts ascending (smallest to largest)
-				let mut sorted_amounts = probe_config.probe_amount_msats.clone();
-				sorted_amounts.sort();
+	if let Some(probe_config) = probing_config {
+		if probe_config.peers.is_empty() {
+			println!("WARNING: probing.peers is empty in config.json. Probing disabled.");
+		} else if probe_config.amount_msats.is_empty() {
+			println!("WARNING: probing.amount_msats is empty in config.json. Probing disabled.");
+		} else {
+			// Sort amounts ascending (smallest to largest)
+			let mut sorted_amounts = probe_config.amount_msats.clone();
+			sorted_amounts.sort();
 
-				let probe_timeout = Duration::from_secs(probe_config.probe_timeout_sec);
+			let probe_timeout = Duration::from_secs(probe_config.timeout_sec);
 
-				// Log startup configuration
-				lightning::log_info!(
-					&*probing_logger,
-					"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s",
-					probe_config.probe_peers.len(),
-					sorted_amounts.len(),
-					sorted_amounts,
-					probe_config.probe_interval_sec,
-					probe_config.probe_timeout_sec
-				);
+			// Log startup configuration
+			lightning::log_info!(
+				&*probing_logger,
+				"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s",
+				probe_config.peers.len(),
+				sorted_amounts.len(),
+				sorted_amounts,
+				probe_config.interval_sec,
+				probe_config.timeout_sec
+			);
 
-				tokio::spawn(async move {
-					let mut interval =
-						tokio::time::interval(Duration::from_secs(probe_config.probe_interval_sec));
-					loop {
-						interval.tick().await;
+			tokio::spawn(async move {
+				let mut interval =
+					tokio::time::interval(Duration::from_secs(probe_config.interval_sec));
+				loop {
+					interval.tick().await;
 
-						// Probe each peer with amounts from smallest to largest
-						for peer in &probe_config.probe_peers {
-							let peer_short = truncate_pubkey(peer);
-							'amounts: for &amount in &sorted_amounts {
-								// Send the probe and get the payment hash
-								let payment_hash = prepare_probe(
-									&probing_cm,
-									&probing_graph,
-									&probing_logger,
-									&probing_scorer,
-									peer,
+					// Probe each peer with amounts from smallest to largest
+					for peer in &probe_config.peers {
+						let peer_short = truncate_pubkey(peer);
+						'amounts: for &amount in &sorted_amounts {
+							// Send the probe and get the payment hash
+							let payment_hash = prepare_probe(
+								&probing_cm,
+								&probing_graph,
+								&probing_logger,
+								&probing_scorer,
+								peer,
+								amount,
+							);
+
+							if let Some(hash) = payment_hash {
+								lightning::log_info!(
+									&*probing_logger,
+									"Probe SENT to {} for {} msat (hash: {})",
+									peer_short,
 									amount,
+									hash
 								);
 
-								if let Some(hash) = payment_hash {
-									lightning::log_info!(
-										&*probing_logger,
-										"Probe SENT to {} for {} msat (hash: {})",
-										peer_short,
-										amount,
-										hash
-									);
+								// Register the probe and get a receiver for the outcome
+								let rx = probing_tracker.lock().unwrap().register_probe(hash);
 
-									// Register the probe and get a receiver for the outcome
-									let rx = probing_tracker.lock().unwrap().register_probe(hash);
+								// Wait for the probe outcome with timeout
+								let outcome = tokio::time::timeout(probe_timeout, rx).await;
 
-									// Wait for the probe outcome with timeout
-									let outcome = tokio::time::timeout(probe_timeout, rx).await;
-
-									match outcome {
-										Ok(Ok(ProbeOutcome::Success)) => {
-											lightning::log_info!(
-												&*probing_logger,
-												"Probe SUCCESS to {} for {} msat (hash: {})",
-												peer_short,
-												amount,
-												hash
-											);
-											// Probe succeeded, continue to next amount
-										},
-										Ok(Ok(ProbeOutcome::Failed)) => {
-											lightning::log_warn!(
-												&*probing_logger,
-												"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
-												peer_short,
-												amount,
-												hash
-											);
-											break 'amounts;
-										},
-										Ok(Err(_)) => {
-											lightning::log_warn!(
-												&*probing_logger,
-												"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
-												peer_short,
-												amount,
-												hash
-											);
-											break 'amounts;
-										},
-										Err(_) => {
-											lightning::log_warn!(
-												&*probing_logger,
-												"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
-												peer_short,
-												amount,
-												hash
-											);
-											// Clean up the pending probe to avoid memory leak
-											probing_tracker
-												.lock()
-												.unwrap()
-												.pending_probes
-												.remove(&hash);
-											break 'amounts;
-										},
-									}
-								} else {
-									lightning::log_warn!(
-										&*probing_logger,
-										"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
-										peer_short,
-										amount
-									);
-									break 'amounts;
+								match outcome {
+									Ok(Ok(ProbeOutcome::Success)) => {
+										lightning::log_info!(
+											&*probing_logger,
+											"Probe SUCCESS to {} for {} msat (hash: {})",
+											peer_short,
+											amount,
+											hash
+										);
+										// Probe succeeded, continue to next amount
+									},
+									Ok(Ok(ProbeOutcome::Failed)) => {
+										lightning::log_warn!(
+											&*probing_logger,
+											"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
+											peer_short,
+											amount,
+											hash
+										);
+										break 'amounts;
+									},
+									Ok(Err(_)) => {
+										lightning::log_warn!(
+											&*probing_logger,
+											"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
+											peer_short,
+											amount,
+											hash
+										);
+										break 'amounts;
+									},
+									Err(_) => {
+										lightning::log_warn!(
+											&*probing_logger,
+											"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
+											peer_short,
+											amount,
+											hash
+										);
+										// Clean up the pending probe to avoid memory leak
+										probing_tracker
+											.lock()
+											.unwrap()
+											.pending_probes
+											.remove(&hash);
+										break 'amounts;
+									},
 								}
+							} else {
+								lightning::log_warn!(
+									&*probing_logger,
+									"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
+									peer_short,
+									amount
+								);
+								break 'amounts;
 							}
 						}
 					}
-				});
-			}
-		},
-		Err(_) => println!(
-			"WARNING: prober_config.json at {}/prober_config.json is missing or malformed. Probing disabled.",
-			ldk_data_dir
-		),
-	};
+				}
+			});
+		}
+	}
 
 	// Start periodic rapid gossip sync updates
 	if let Some(rapid_sync) = rapid_sync_manager {
