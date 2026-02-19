@@ -4,6 +4,7 @@ mod config;
 mod cli;
 mod convert;
 mod disk;
+mod dns_bootstrap;
 mod hex_utils;
 mod rapid_sync;
 mod sweep;
@@ -1091,6 +1092,139 @@ async fn start_ldk() {
 			});
 		}
 	});
+
+	// Step 18.5: DNS Bootstrap (mainnet only, if enabled and first startup)
+	if args.dns_bootstrap_enabled && args.network == Network::Bitcoin {
+		let should_bootstrap =
+			peer_manager.list_peers().is_empty() && channel_manager.list_channels().is_empty();
+
+		if should_bootstrap {
+			lightning::log_debug!(
+				&*logger,
+				"No existing peers or channels detected. Starting DNS bootstrap from seed: {}",
+				args.dns_bootstrap_seed
+			);
+
+			let bootstrap_client = dns_bootstrap::DnsBootstrapClient::new(
+				args.dns_bootstrap_seed.clone(),
+				args.dns_bootstrap_num_peers,
+				args.dns_bootstrap_realm,
+				args.dns_bootstrap_address_types,
+			);
+
+			match bootstrap_client.query_bootstrap_peers().await {
+				Ok(peers) => {
+					lightning::log_debug!(
+						&*logger,
+						"DNS bootstrap discovered {} peer addresses",
+						peers.len()
+					);
+
+					// Connect to first 5 peers maximum (only those with node_id)
+					let peers_with_id: Vec<_> =
+						peers.iter().filter(|p| p.node_id.is_some()).take(5).collect();
+
+					if peers_with_id.is_empty() {
+						lightning::log_warn!(
+							&*logger,
+							"DNS bootstrap found peers but could not extract node IDs. \
+							Cannot establish connections without node IDs."
+						);
+					} else {
+						for peer in peers_with_id {
+							let node_id = peer.node_id.unwrap();
+							let addr = peer.addr;
+
+							lightning::log_debug!(
+								&*logger,
+								"Attempting bootstrap connection to {} at {}",
+								node_id,
+								addr
+							);
+
+							let pm = Arc::clone(&peer_manager);
+							let logger_clone = Arc::clone(&logger);
+
+							tokio::spawn(async move {
+								// 10 second timeout per connection
+								let connect_future = async {
+									match lightning_net_tokio::connect_outbound(pm, node_id, addr)
+										.await
+									{
+										Some(connection_closed_future) => {
+											// Connection established, wait briefly to confirm
+											let mut connection_closed_future =
+												Box::pin(connection_closed_future);
+											tokio::select! {
+												_ = &mut connection_closed_future => {
+													lightning::log_debug!(
+														&*logger_clone,
+														"Bootstrap connection to {} closed immediately",
+														node_id
+													);
+												},
+												_ = tokio::time::sleep(Duration::from_millis(500)) => {
+													lightning::log_debug!(
+														&*logger_clone,
+														"Bootstrap connection to {} at {} established",
+														node_id,
+														addr
+													);
+												},
+											}
+										},
+										None => {
+											lightning::log_debug!(
+												&*logger_clone,
+												"Bootstrap connection to {} at {} failed",
+												node_id,
+												addr
+											);
+										},
+									}
+								};
+
+								// Apply 10 second timeout
+								if tokio::time::timeout(Duration::from_secs(10), connect_future)
+									.await
+									.is_err()
+								{
+									lightning::log_debug!(
+										&*logger_clone,
+										"Bootstrap connection to {} timed out after 10 seconds",
+										addr
+									);
+								}
+							});
+
+							// Small delay between connections to avoid overwhelming
+							tokio::time::sleep(Duration::from_millis(100)).await;
+						}
+					}
+				},
+				Err(e) => {
+					lightning::log_warn!(
+						&*logger,
+						"DNS bootstrap failed: {:?}. Node will rely on manual peer connections.",
+						e
+					);
+				},
+			}
+		} else {
+			lightning::log_debug!(
+				&*logger,
+				"Skipping DNS bootstrap: {} existing peers, {} channels",
+				peer_manager.list_peers().len(),
+				channel_manager.list_channels().len()
+			);
+		}
+	} else if args.dns_bootstrap_enabled && args.network != Network::Bitcoin {
+		lightning::log_debug!(
+			&*logger,
+			"DNS bootstrap disabled for non-mainnet network: {:?}",
+			args.network
+		);
+	}
 
 	// Step 19: Connect and Disconnect Blocks
 	let output_sweeper: Arc<OutputSweeper> = Arc::new(output_sweeper);

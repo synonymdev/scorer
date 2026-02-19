@@ -24,6 +24,8 @@ pub struct NodeConfig {
 	#[serde(default)]
 	pub rapid_gossip_sync: RapidGossipSyncConfig,
 	pub probing: Option<ProbingConfig>,
+	#[serde(default)]
+	pub dns_bootstrap: DnsBootstrapConfig,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +67,25 @@ pub struct ProbingConfig {
 	pub timeout_sec: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsBootstrapConfig {
+	#[serde(default = "default_true")]
+	pub enabled: bool,
+
+	#[serde(default = "default_dns_seed")]
+	pub seed: String,
+
+	#[serde(default = "default_bootstrap_num_peers")]
+	pub num_peers: u8,
+
+	#[serde(default)]
+	pub realm: u8, // 0 for Bitcoin
+
+	#[serde(default = "default_address_types")]
+	pub address_types: u8, // 6 for IPv4+IPv6 (bits 1 and 2)
+}
+
 // Default functions
 fn default_network() -> String {
 	"testnet".to_string()
@@ -86,9 +107,27 @@ fn default_probe_timeout() -> u64 {
 	60
 }
 
+fn default_dns_seed() -> String {
+	"lseed.bitcoinstats.com".to_string()
+}
+
+fn default_bootstrap_num_peers() -> u8 {
+	25
+}
+
+fn default_address_types() -> u8 {
+	6 // IPv4 (bit 1) + IPv6 (bit 2)
+}
+
 impl Default for RapidGossipSyncConfig {
 	fn default() -> Self {
 		Self { enabled: true, url: None, interval_hours: 6 }
+	}
+}
+
+impl Default for DnsBootstrapConfig {
+	fn default() -> Self {
+		Self { enabled: true, seed: default_dns_seed(), num_peers: 25, realm: 0, address_types: 6 }
 	}
 }
 
@@ -135,6 +174,15 @@ impl NodeConfig {
 					"Node name cannot exceed 32 bytes".to_string(),
 				));
 			}
+		}
+
+		// Warn if DNS bootstrap is enabled on non-mainnet
+		if self.dns_bootstrap.enabled && self.network != "mainnet" {
+			eprintln!(
+				"WARNING: DNS bootstrap is enabled but will be ignored on {} network. \
+				DNS bootstrap only works on mainnet.",
+				self.network
+			);
 		}
 
 		Ok(())
@@ -192,6 +240,11 @@ impl NodeConfig {
 			rapid_gossip_sync_url: self.rapid_gossip_sync.url,
 			rapid_gossip_sync_interval_hours: self.rapid_gossip_sync.interval_hours,
 			probing,
+			dns_bootstrap_enabled: self.dns_bootstrap.enabled,
+			dns_bootstrap_seed: self.dns_bootstrap.seed,
+			dns_bootstrap_num_peers: self.dns_bootstrap.num_peers,
+			dns_bootstrap_realm: self.dns_bootstrap.realm,
+			dns_bootstrap_address_types: self.dns_bootstrap.address_types,
 		}
 	}
 }
@@ -211,7 +264,7 @@ pub fn print_config_help() {
     "rpc_username": "your_rpc_user",
     "rpc_password": "your_rpc_password"
   }},
-  "network": "testnet",
+  "network": "mainnet",
   "ldk": {{
     "peer_listening_port": 9735,
     "announced_node_name": "MyNode",
@@ -221,6 +274,13 @@ pub fn print_config_help() {
     "enabled": true,
     "interval_hours": 6
   }},
+  "dns_bootstrap": {{
+    "enabled": true,
+    "seed": "lseed.bitcoinstats.com",
+    "num_peers": 25,
+    "realm": 0,
+    "address_types": 6
+  }},
   "probing": {{
     "interval_sec": 300,
     "peers": [],
@@ -229,4 +289,7 @@ pub fn print_config_help() {
   }}
 }}"#
 	);
+	println!();
+	println!("Note: DNS bootstrap (BOLT #10) only works on mainnet. For testnet/signet/regtest,");
+	println!("      it will be automatically disabled regardless of the 'enabled' setting.");
 }
