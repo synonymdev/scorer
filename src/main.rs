@@ -1308,9 +1308,9 @@ async fn start_ldk() {
 	let probing_tracker = Arc::clone(&probe_tracker);
 	if let Some(probe_config) = probing_config {
 		if probe_config.peers.is_empty() {
-			println!("WARNING: probing.peers is empty in config.json. Probing disabled.");
+			println!("WARNING: probing.peers is empty in config.toml. Probing disabled.");
 		} else if probe_config.amount_msats.is_empty() {
-			println!("WARNING: probing.amount_msats is empty in config.json. Probing disabled.");
+			println!("WARNING: probing.amount_msats is empty in config.toml. Probing disabled.");
 		} else {
 			// Sort amounts ascending (smallest to largest)
 			let mut sorted_amounts = probe_config.amount_msats.clone();
