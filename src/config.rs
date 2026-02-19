@@ -63,6 +63,10 @@ pub struct ProbingConfig {
 	pub amount_msats: Vec<u64>,
 	#[serde(default = "default_probe_timeout")]
 	pub timeout_sec: u64,
+	#[serde(default = "default_probe_delay")]
+	pub probe_delay_sec: u64,
+	#[serde(default = "default_peer_delay")]
+	pub peer_delay_sec: u64,
 }
 
 // Default functions
@@ -84,6 +88,14 @@ fn default_rgs_interval() -> u64 {
 
 fn default_probe_timeout() -> u64 {
 	60
+}
+
+fn default_probe_delay() -> u64 {
+	1
+}
+
+fn default_peer_delay() -> u64 {
+	2
 }
 
 impl Default for RapidGossipSyncConfig {
@@ -177,6 +189,8 @@ impl NodeConfig {
 			peers: p.peers,
 			amount_msats: p.amount_msats,
 			timeout_sec: p.timeout_sec,
+			probe_delay_sec: p.probe_delay_sec,
+			peer_delay_sec: p.peer_delay_sec,
 		});
 		LdkUserInfo {
 			bitcoind_rpc_username: self.bitcoind.rpc_username,
@@ -225,7 +239,9 @@ pub fn print_config_help() {
     "interval_sec": 300,
     "peers": [],
     "amount_msats": [1000, 10000, 100000],
-    "timeout_sec": 60
+    "timeout_sec": 60,
+    "probe_delay_sec": 1,
+    "peer_delay_sec": 2
   }}
 }}"#
 	);
