@@ -29,9 +29,14 @@ rand = "0.4"
 serde_json = { version = "1.0" }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = [ "io-util", "macros", "rt", "rt-multi-thread", "sync", "net", "time", "io-std" ] }
+reqwest = { version = "0.11", features = ["tokio-native-tls", "stream"] }
+futures-util = "0.3"
 
 [profile.release]
 panic = "abort"
+
+[dev-dependencies]
+tempfile = "3.0"
 
 [profile.dev]
 panic = "abort"
