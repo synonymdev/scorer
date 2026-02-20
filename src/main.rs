@@ -4,6 +4,7 @@ mod config;
 mod cli;
 mod convert;
 mod disk;
+mod dns_bootstrap;
 mod hex_utils;
 mod rapid_sync;
 mod sweep;
@@ -1266,6 +1267,79 @@ async fn start_ldk() {
 	// Capture values before moving args
 	let rapid_gossip_sync_interval_hours = args.rapid_gossip_sync_interval_hours;
 	let probing_config = args.probing.clone();
+	let dns_bootstrap_config = args.dns_bootstrap.clone();
+
+	// DNS bootstrap: discover peers from BOLT-0010 DNS seeds.
+	if let Some(dns_config) = dns_bootstrap_config {
+		if dns_config.enabled {
+			match dns_bootstrap::DnsBootstrapper::new(dns_config) {
+				Ok(bootstrapper) => {
+					let bootstrap_pm = Arc::clone(&peer_manager);
+					let stop_bootstrap = Arc::clone(&stop_listen_connect);
+					let interval_secs = bootstrapper.interval_secs();
+					let num_peers = bootstrapper.num_peers();
+
+					println!(
+						"DNS bootstrap enabled: {} seeds, target {} peers, interval {}s",
+						bootstrapper.config().seeds.len(),
+						num_peers,
+						interval_secs,
+					);
+
+					tokio::spawn(async move {
+						// Initial delay to let networking and gossip start.
+						tokio::time::sleep(Duration::from_secs(5)).await;
+
+						let mut interval =
+							tokio::time::interval(Duration::from_secs(interval_secs));
+						loop {
+							interval.tick().await;
+
+							if stop_bootstrap.load(Ordering::Acquire) {
+								return;
+							}
+
+							// Build ignore set from currently connected peers.
+							let ignore: std::collections::HashSet<
+								lightning::routing::gossip::NodeId,
+							> = bootstrap_pm
+								.list_peers()
+								.iter()
+								.map(|p| {
+									lightning::routing::gossip::NodeId::from_pubkey(
+										&p.counterparty_node_id,
+									)
+								})
+								.collect();
+
+							match bootstrapper.sample_node_addrs(num_peers, &ignore).await {
+								Ok(peers) => {
+									println!(
+										"[dns_bootstrap] Discovered {} peers",
+										peers.len()
+									);
+									for peer in peers {
+										let _ = cli::do_connect_peer(
+											peer.pubkey,
+											peer.addr,
+											Arc::clone(&bootstrap_pm),
+										)
+										.await;
+									}
+								},
+								Err(e) => {
+									eprintln!("[dns_bootstrap] Bootstrap failed: {}", e);
+								},
+							}
+						}
+					});
+				},
+				Err(e) => {
+					eprintln!("[dns_bootstrap] Failed to initialize bootstrapper: {}", e);
+				},
+			}
+		}
+	}
 
 	// Regularly broadcast our node_announcement. This is only required (or possible) if we have
 	// some public channels.

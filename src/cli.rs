@@ -60,6 +60,7 @@ pub(crate) struct LdkUserInfo {
 	pub(crate) rapid_gossip_sync_url: Option<String>,
 	pub(crate) rapid_gossip_sync_interval_hours: u64,
 	pub(crate) probing: Option<ProbingConfig>,
+	pub(crate) dns_bootstrap: Option<crate::dns_bootstrap::DnsBootstrapConfig>,
 }
 
 pub(crate) async fn poll_for_user_input(
