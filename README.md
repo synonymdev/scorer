@@ -30,18 +30,18 @@ Network options: `mainnet`, `testnet`, `regtest`, `signet` (default is `testnet`
 ### Example config
 
 ```toml
+network = "testnet"
+
 [bitcoind]
 rpc_host = "127.0.0.1"
 rpc_port = 8332
 rpc_username = "your_rpc_user"
 rpc_password = "your_rpc_password"
 
-network = "testnet"
-
-[ldk]
-peer_listening_port = 9735
-announced_node_name = "MyLDKNode"
-announced_listen_addr = []
+# [ldk]
+# peer_listening_port = 9735
+# announced_node_name = "MyLDKNode"
+# announced_listen_addr = []
 
 [rapid_gossip_sync]
 enabled = true
@@ -53,6 +53,9 @@ interval_sec = 300
 peers = ["02abc123...@1.2.3.4:9735"]
 amount_msats = [1000, 10000, 100000, 1000000]
 timeout_sec = 60
+
+probe_delay_sec = 1
+peer_delay_sec = 2
 ```
 
 ### Key options
