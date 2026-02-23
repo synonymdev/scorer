@@ -22,8 +22,8 @@ Config is loaded from `<storage_dir>/.ldk/config.toml` and strictly validated. U
 fields cause an error (`deny_unknown_fields`).
 
 Required sections: `bitcoind`.
-Optional sections: `ldk`, `rapid_gossip_sync`, and `probing` (probing is disabled if
-missing).
+Optional sections: `ldk`, `rapid_gossip_sync`, `probing` (probing is disabled if
+missing), and `dns_bootstrap` (enabled by default with sensible defaults).
 
 Network options: `mainnet`, `testnet`, `regtest`, `signet` (default is `testnet`).
 
@@ -56,6 +56,13 @@ timeout_sec = 60
 
 probe_delay_sec = 1
 peer_delay_sec = 2
+
+[dns_bootstrap]
+enabled = true
+seeds = [ "nodes.lightning.wiki", "lseed.bitcoinstats.com" ]
+timeout_secs = 30
+num_peers = 10
+interval_secs = 300
 ```
 
 ### Key options
@@ -80,6 +87,12 @@ fails, the node falls back to P2P gossip sync. `url` defaults to
 `probing`:
 Optional. If omitted, probing is disabled. Configure probe interval, peers, probe
 amounts in millisatoshis, and timeout.
+
+`dns_bootstrap`:
+Optional. Enabled by default. Discovers peers via DNS SRV lookups per BOLT-0010.
+`seeds` defaults to `nodes.lightning.wiki` and `lseed.bitcoinstats.com`.
+`timeout_secs` defaults to 30, `num_peers` defaults to 10, `interval_secs`
+defaults to 300. Set `enabled` to `false` to disable.
 
 ## License
 

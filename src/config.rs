@@ -1,4 +1,5 @@
 use crate::cli::LdkUserInfo;
+use crate::dns_bootstrap::DnsBootstrapConfig;
 use bitcoin::network::Network;
 use lightning::ln::msgs::SocketAddress;
 use serde::Deserialize;
@@ -24,6 +25,7 @@ pub struct NodeConfig {
 	#[serde(default)]
 	pub rapid_gossip_sync: RapidGossipSyncConfig,
 	pub probing: Option<ProbingConfig>,
+	pub dns_bootstrap: Option<DnsBootstrapConfig>,
 }
 
 #[derive(Deserialize)]
@@ -206,6 +208,7 @@ impl NodeConfig {
 			rapid_gossip_sync_url: self.rapid_gossip_sync.url,
 			rapid_gossip_sync_interval_hours: self.rapid_gossip_sync.interval_hours,
 			probing,
+			dns_bootstrap: self.dns_bootstrap,
 		}
 	}
 }
@@ -241,6 +244,15 @@ peers = []
 amount_msats = [1000, 10000, 100000]
 timeout_sec = 60
 probe_delay_sec = 1
-peer_delay_sec = 2"#
+peer_delay_sec = 2
+
+[dns_bootstrap]
+enabled = true
+seeds = [ "nodes.lightning.wiki", "lseed.bitcoinstats.com" ]
+timeout_secs = 30
+num_peers = 10
+interval_secs = 300
+
+"#
 	);
 }
