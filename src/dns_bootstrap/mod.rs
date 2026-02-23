@@ -27,9 +27,6 @@ pub enum DnsBootstrapError {
 	/// DNS operation timed out.
 	Timeout,
 
-	/// Configuration error.
-	ConfigError(String),
-
 	/// Internal DNS resolver error.
 	ResolverError(String),
 }
@@ -48,7 +45,6 @@ impl fmt::Display for DnsBootstrapError {
 				write!(f, "invalid public key: {}", reason)
 			},
 			Self::Timeout => write!(f, "DNS operation timed out"),
-			Self::ConfigError(msg) => write!(f, "config error: {}", msg),
 			Self::ResolverError(msg) => write!(f, "resolver error: {}", msg),
 		}
 	}

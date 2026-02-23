@@ -10,10 +10,10 @@ pub struct SrvRecord {
 	pub target: String,
 	/// Port the node is listening on.
 	pub port: u16,
-	/// SRV priority.
-	pub priority: u16,
-	/// SRV weight.
-	pub weight: u16,
+	/// SRV priority (retained for future use).
+	pub _priority: u16,
+	/// SRV weight (retained for future use).
+	pub _weight: u16,
 }
 
 /// Executes DNS SRV queries and A/AAAA lookups for BOLT-0010 bootstrap.
@@ -25,8 +25,9 @@ pub struct SrvQueryExecutor {
 impl SrvQueryExecutor {
 	/// Create a new executor using the system DNS resolver.
 	pub fn new(timeout: Duration) -> Result<Self, DnsBootstrapError> {
-		let resolver = TokioAsyncResolver::tokio_from_system_conf()
-			.map_err(|e| DnsBootstrapError::ResolverError(format!("system resolver init: {}", e)))?;
+		let resolver = TokioAsyncResolver::tokio_from_system_conf().map_err(|e| {
+			DnsBootstrapError::ResolverError(format!("system resolver init: {}", e))
+		})?;
 		Ok(Self { resolver, timeout })
 	}
 
@@ -40,17 +41,15 @@ impl SrvQueryExecutor {
 		let lookup = tokio::time::timeout(self.timeout, self.resolver.srv_lookup(&query_name))
 			.await
 			.map_err(|_| DnsBootstrapError::Timeout)?
-			.map_err(|e| {
-				DnsBootstrapError::SrvQueryFailed(format!("{}: {}", query_name, e))
-			})?;
+			.map_err(|e| DnsBootstrapError::SrvQueryFailed(format!("{}: {}", query_name, e)))?;
 
 		let records: Vec<SrvRecord> = lookup
 			.iter()
 			.map(|srv| SrvRecord {
 				target: srv.target().to_utf8(),
 				port: srv.port(),
-				priority: srv.priority(),
-				weight: srv.weight(),
+				_priority: srv.priority(),
+				_weight: srv.weight(),
 			})
 			.collect();
 
@@ -61,14 +60,13 @@ impl SrvQueryExecutor {
 	///
 	/// Matches LND behavior: only the first returned IP is used.
 	pub async fn resolve_host(&self, hostname: &str) -> Result<IpAddr, DnsBootstrapError> {
-		let lookup =
-			tokio::time::timeout(self.timeout, self.resolver.lookup_ip(hostname))
-				.await
-				.map_err(|_| DnsBootstrapError::Timeout)?
-				.map_err(|e| DnsBootstrapError::HostResolutionFailed {
-					hostname: hostname.to_string(),
-					reason: e.to_string(),
-				})?;
+		let lookup = tokio::time::timeout(self.timeout, self.resolver.lookup_ip(hostname))
+			.await
+			.map_err(|_| DnsBootstrapError::Timeout)?
+			.map_err(|e| DnsBootstrapError::HostResolutionFailed {
+				hostname: hostname.to_string(),
+				reason: e.to_string(),
+			})?;
 
 		lookup.iter().next().ok_or_else(|| DnsBootstrapError::HostResolutionFailed {
 			hostname: hostname.to_string(),

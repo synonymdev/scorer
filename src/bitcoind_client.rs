@@ -239,10 +239,7 @@ impl BitcoindClient {
 	pub async fn create_raw_transaction(&self, outputs: Vec<HashMap<String, f64>>) -> RawTx {
 		let outputs_json = serde_json::json!(outputs);
 		self.bitcoind_rpc_client
-			.call_method::<RawTx>(
-				"createrawtransaction",
-				&[serde_json::json!([]), outputs_json],
-			)
+			.call_method::<RawTx>("createrawtransaction", &[serde_json::json!([]), outputs_json])
 			.await
 			.unwrap()
 	}
@@ -282,10 +279,7 @@ impl BitcoindClient {
 		let tx_hex_json = serde_json::json!(tx_hex);
 		let rpc_client = self.get_new_rpc_client();
 		async move {
-			rpc_client
-				.call_method("signrawtransactionwithwallet", &[tx_hex_json])
-				.await
-				.unwrap()
+			rpc_client.call_method("signrawtransactionwithwallet", &[tx_hex_json]).await.unwrap()
 		}
 	}
 
@@ -309,9 +303,7 @@ impl BitcoindClient {
 
 	pub fn list_unspent(&self) -> impl Future<Output = ListUnspentResponse> {
 		let rpc_client = self.get_new_rpc_client();
-		async move {
-			rpc_client.call_method::<ListUnspentResponse>("listunspent", &[]).await.unwrap()
-		}
+		async move { rpc_client.call_method::<ListUnspentResponse>("listunspent", &[]).await.unwrap() }
 	}
 }
 
@@ -392,7 +384,7 @@ impl WalletSource for BitcoindClient {
 										value,
 										script_pubkey: utxo.address.script_pubkey(),
 									},
-								satisfaction_weight: WITNESS_SCALE_FACTOR as u64 +
+									satisfaction_weight: WITNESS_SCALE_FACTOR as u64 +
 									1 /* witness items */ + 1 /* schnorr sig len */ + 64, /* schnorr sig */
 								})
 								.ok()

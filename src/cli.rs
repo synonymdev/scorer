@@ -323,10 +323,10 @@ pub(crate) async fn poll_for_user_input(
 									&invoice,
 									user_provided_amt,
 									&outbound_payments,
-							&fs_store,
-						)
-						.await
-					},
+									&fs_store,
+								)
+								.await
+							},
 							Err(e) => {
 								println!("ERROR: invalid invoice: {:?}", e);
 							},
@@ -361,15 +361,15 @@ pub(crate) async fn poll_for_user_input(
 							continue;
 						},
 					};
-				keysend(
-					&channel_manager,
-					dest_pubkey,
-					amt_msat,
-					&*keys_manager,
-					&outbound_payments,
-					&fs_store,
-				)
-				.await;
+					keysend(
+						&channel_manager,
+						dest_pubkey,
+						amt_msat,
+						&*keys_manager,
+						&outbound_payments,
+						&fs_store,
+					)
+					.await;
 				},
 				"getoffer" => {
 					let offer_builder = channel_manager.create_offer_builder();
@@ -1026,9 +1026,7 @@ pub(crate) fn parse_peer_info(
 
 	let pubkey = hex_utils::to_compressed_pubkey(pubkey.unwrap());
 	if pubkey.is_none() {
-		return Err(std::io::Error::other(
-			"ERROR: unable to parse given pubkey for node",
-		));
+		return Err(std::io::Error::other("ERROR: unable to parse given pubkey for node"));
 	}
 
 	Ok((pubkey.unwrap(), peer_addr.unwrap().unwrap()))

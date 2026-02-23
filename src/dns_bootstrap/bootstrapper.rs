@@ -13,8 +13,8 @@ use std::time::Duration;
 pub struct BootstrappedPeer {
 	/// The node's secp256k1 public key.
 	pub pubkey: PublicKey,
-	/// The node's LDK NodeId (derived from pubkey).
-	pub node_id: NodeId,
+	/// The node's LDK NodeId (derived from pubkey, retained for future use).
+	pub _node_id: NodeId,
 	/// The node's network address (IP + port from SRV record).
 	pub addr: SocketAddr,
 }
@@ -56,27 +56,17 @@ impl DnsBootstrapper {
 			let srv_records = match self.query_executor.query_srv(seed).await {
 				Ok(records) => records,
 				Err(e) => {
-					eprintln!(
-						"[dns_bootstrap] SRV query failed for {}: {}",
-						seed, e
-					);
+					eprintln!("[dns_bootstrap] SRV query failed for {}: {}", seed, e);
 					continue;
 				},
 			};
 
 			if srv_records.is_empty() {
-				eprintln!(
-					"[dns_bootstrap] No SRV records returned from {}",
-					seed
-				);
+				eprintln!("[dns_bootstrap] No SRV records returned from {}", seed);
 				continue;
 			}
 
-			eprintln!(
-				"[dns_bootstrap] Got {} SRV records from {}",
-				srv_records.len(),
-				seed
-			);
+			eprintln!("[dns_bootstrap] Got {} SRV records from {}", srv_records.len(), seed);
 
 			// Process each SRV record.
 			for srv in srv_records {
@@ -105,16 +95,13 @@ impl DnsBootstrapper {
 				let ip = match self.query_executor.resolve_host(&srv.target).await {
 					Ok(ip) => ip,
 					Err(e) => {
-						eprintln!(
-							"[dns_bootstrap] Failed to resolve {}: {}",
-							srv.target, e
-						);
+						eprintln!("[dns_bootstrap] Failed to resolve {}: {}", srv.target, e);
 						continue;
 					},
 				};
 
 				let addr = SocketAddr::new(ip, srv.port);
-				peers.push(BootstrappedPeer { pubkey, node_id, addr });
+				peers.push(BootstrappedPeer { pubkey, _node_id: node_id, addr });
 			}
 		}
 

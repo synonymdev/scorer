@@ -1,7 +1,7 @@
 mod args;
 pub mod bitcoind_client;
-mod config;
 mod cli;
+mod config;
 mod convert;
 mod disk;
 mod dns_bootstrap;
@@ -344,18 +344,13 @@ async fn handle_ldk_events<'a>(
 			let funded_tx = bitcoind_client.fund_raw_transaction(raw_tx).await;
 
 			// Sign the final funding transaction and give it to LDK, who will eventually broadcast it.
-			let signed_tx =
-				bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await;
+			let signed_tx = bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await;
 			assert!(signed_tx.complete);
 			let final_tx: Transaction =
 				encode::deserialize(&hex_utils::to_vec(&signed_tx.hex).unwrap()).unwrap();
 			// Give the funding transaction back to LDK for opening the channel.
 			if channel_manager
-				.funding_transaction_generated(
-					temporary_channel_id,
-					counterparty_node_id,
-					final_tx,
-				)
+				.funding_transaction_generated(temporary_channel_id, counterparty_node_id, final_tx)
 				.is_err()
 			{
 				println!(
@@ -375,13 +370,9 @@ async fn handle_ldk_events<'a>(
 			print!("> ");
 			std::io::stdout().flush().unwrap();
 			let payment_preimage = match purpose {
-				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => {
-					payment_preimage
-				},
+				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => payment_preimage,
-				PaymentPurpose::Bolt12RefundPayment { payment_preimage, .. } => {
-					payment_preimage
-				},
+				PaymentPurpose::Bolt12RefundPayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
 			};
 			channel_manager.claim_funds(payment_preimage.unwrap());
@@ -395,17 +386,13 @@ async fn handle_ldk_events<'a>(
 			std::io::stdout().flush().unwrap();
 			let (payment_preimage, payment_secret) = match purpose {
 				PaymentPurpose::Bolt11InvoicePayment {
-					payment_preimage,
-					payment_secret,
-					..
-				} => (payment_preimage, Some(payment_secret)),
-				PaymentPurpose::Bolt12OfferPayment {
 					payment_preimage, payment_secret, ..
 				} => (payment_preimage, Some(payment_secret)),
+				PaymentPurpose::Bolt12OfferPayment { payment_preimage, payment_secret, .. } => {
+					(payment_preimage, Some(payment_secret))
+				},
 				PaymentPurpose::Bolt12RefundPayment {
-					payment_preimage,
-					payment_secret,
-					..
+					payment_preimage, payment_secret, ..
 				} => (payment_preimage, Some(payment_secret)),
 				PaymentPurpose::SpontaneousPayment(preimage) => (Some(preimage), None),
 			};
@@ -432,11 +419,7 @@ async fn handle_ldk_events<'a>(
 			write_future.await.unwrap();
 		},
 		Event::PaymentSent {
-			payment_preimage,
-			payment_hash,
-			fee_paid_msat,
-			payment_id,
-			..
+			payment_preimage, payment_hash, fee_paid_msat, payment_id, ..
 		} => {
 			let write_future = {
 				let mut outbound = outbound_payments.lock().unwrap();
@@ -465,9 +448,7 @@ async fn handle_ldk_events<'a>(
 			write_future.await.unwrap();
 		},
 		Event::OpenChannelRequest {
-			ref temporary_channel_id,
-			ref counterparty_node_id,
-			..
+			ref temporary_channel_id, ref counterparty_node_id, ..
 		} => {
 			let mut random_bytes = [0u8; 16];
 			random_bytes.copy_from_slice(&keys_manager.get_secure_random_bytes()[..16]);
@@ -510,21 +491,13 @@ async fn handle_ldk_events<'a>(
 					"\nEVENT: Failed to send payment to payment ID {}, payment hash {}: {:?}",
 					payment_id,
 					hash,
-					if let Some(r) = reason {
-						r
-					} else {
-						PaymentFailureReason::RetriesExhausted
-					}
+					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
 				);
 			} else {
 				print!(
 					"\nEVENT: Failed fetch invoice for payment ID {}: {:?}",
 					payment_id,
-					if let Some(r) = reason {
-						r
-					} else {
-						PaymentFailureReason::RetriesExhausted
-					}
+					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
 				);
 			}
 			print!("> ");
@@ -557,8 +530,7 @@ async fn handle_ldk_events<'a>(
 
 			let node_str = |channel_id: &Option<ChannelId>| match channel_id {
 				None => String::new(),
-				Some(channel_id) => match channels.iter().find(|c| c.channel_id == *channel_id)
-				{
+				Some(channel_id) => match channels.iter().find(|c| c.channel_id == *channel_id) {
 					None => String::new(),
 					Some(channel) => {
 						match nodes.get(&NodeId::from_pubkey(&channel.counterparty.node_id)) {
@@ -578,11 +550,8 @@ async fn handle_ldk_events<'a>(
 					.map(|channel_id| format!(" with channel {}", channel_id))
 					.unwrap_or_default()
 			};
-			let from_prev_str = format!(
-				" from {}{}",
-				node_str(&prev_channel_id),
-				channel_str(&prev_channel_id),
-			);
+			let from_prev_str =
+				format!(" from {}{}", node_str(&prev_channel_id), channel_str(&prev_channel_id),);
 			let to_next_str =
 				format!(" to {}{}", node_str(&next_channel_id), channel_str(&next_channel_id));
 
@@ -985,14 +954,16 @@ async fn start_ldk() {
 			"Initializing RapidGossipSync with URL: {}",
 			args.rapid_gossip_sync_url.as_ref().unwrap_or(&"default".to_string())
 		);
-		
+
 		match rapid_sync::RapidGossipSyncManager::new(
 			Arc::clone(&network_graph),
 			args.rapid_gossip_sync_url.clone(),
 			Arc::clone(&fs_store),
 			Arc::clone(&logger),
 			ldk_data_dir.clone(),
-		).await {
+		)
+		.await
+		{
 			Ok(manager) => {
 				lightning::log_info!(&*logger, "RapidGossipSync initialized successfully");
 				Some(Arc::new(tokio::sync::Mutex::new(manager)))
@@ -1004,7 +975,7 @@ async fn start_ldk() {
 					e
 				);
 				None
-			}
+			},
 		}
 	} else {
 		lightning::log_info!(&*logger, "RapidGossipSync disabled by configuration");
@@ -1312,10 +1283,7 @@ async fn start_ldk() {
 
 							match bootstrapper.sample_node_addrs(num_peers, &ignore).await {
 								Ok(peers) => {
-									println!(
-										"[dns_bootstrap] Discovered {} peers",
-										peers.len()
-									);
+									println!("[dns_bootstrap] Discovered {} peers", peers.len());
 									for peer in peers {
 										let _ = cli::do_connect_peer(
 											peer.pubkey,
@@ -1519,22 +1487,22 @@ async fn start_ldk() {
 	if let Some(rapid_sync) = rapid_sync_manager {
 		let rapid_sync_interval = Duration::from_secs(rapid_gossip_sync_interval_hours * 3600);
 		let rapid_sync_logger = Arc::clone(&logger);
-		
+
 		tokio::spawn(async move {
 			let mut interval = tokio::time::interval(rapid_sync_interval);
 			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-			
+
 			// Skip the first tick since we just synced on startup
 			interval.tick().await;
-			
+
 			loop {
 				interval.tick().await;
-				
+
 				lightning::log_info!(
 					&*rapid_sync_logger,
 					"Starting periodic rapid gossip sync update"
 				);
-				
+
 				let mut sync_manager = rapid_sync.lock().await;
 				match sync_manager.sync_network_graph().await {
 					Ok(new_timestamp) => {
@@ -1550,7 +1518,7 @@ async fn start_ldk() {
 							"Periodic rapid gossip sync failed: {:?}",
 							e
 						);
-					}
+					},
 				}
 			}
 		});
