@@ -8,7 +8,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		println!("Usage: {} <ldk_storage_directory_path>", args[0]);
 		println!();
 		println!(
-			"The config.json file should be located at <ldk_storage_directory_path>/.ldk/config.json",
+			"The config.toml file should be located at <ldk_storage_directory_path>/.ldk/config.toml",
 		);
 		crate::config::print_config_help();
 		return Err(());

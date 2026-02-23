@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Probing configuration passed from config.json
+/// Probing configuration passed from config.toml
 #[derive(Clone)]
 pub(crate) struct ProbingConfig {
 	pub(crate) interval_sec: u64,
