@@ -53,12 +53,12 @@ impl DnsBootstrapper {
 			}
 
 			// Query SRV records for this seed.
-			let srv_records = match self.query_executor.query_srv(&seed.primary).await {
+			let srv_records = match self.query_executor.query_srv(seed).await {
 				Ok(records) => records,
 				Err(e) => {
 					eprintln!(
 						"[dns_bootstrap] SRV query failed for {}: {}",
-						seed.primary, e
+						seed, e
 					);
 					continue;
 				},
@@ -67,7 +67,7 @@ impl DnsBootstrapper {
 			if srv_records.is_empty() {
 				eprintln!(
 					"[dns_bootstrap] No SRV records returned from {}",
-					seed.primary
+					seed
 				);
 				continue;
 			}
@@ -75,7 +75,7 @@ impl DnsBootstrapper {
 			eprintln!(
 				"[dns_bootstrap] Got {} SRV records from {}",
 				srv_records.len(),
-				seed.primary
+				seed
 			);
 
 			// Process each SRV record.

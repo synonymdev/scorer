@@ -1,13 +1,5 @@
 use serde::Deserialize;
 
-/// Configuration for a single DNS seed.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DnsSeed {
-	/// Primary seed domain (e.g. "nodes.lightning.wiki").
-	pub primary: String,
-}
-
 /// Configuration for DNS-based peer bootstrapping (BOLT-0010).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,7 +10,7 @@ pub struct DnsBootstrapConfig {
 
 	/// DNS seed servers to query.
 	#[serde(default = "default_seeds")]
-	pub seeds: Vec<DnsSeed>,
+	pub seeds: Vec<String>,
 
 	/// Timeout for individual DNS queries in seconds.
 	#[serde(default = "default_timeout_secs")]
@@ -37,11 +29,8 @@ fn default_enabled() -> bool {
 	true
 }
 
-fn default_seeds() -> Vec<DnsSeed> {
-	vec![
-		DnsSeed { primary: "nodes.lightning.wiki".to_string() },
-		DnsSeed { primary: "lseed.bitcoinstats.com".to_string() },
-	]
+fn default_seeds() -> Vec<String> {
+	vec!["nodes.lightning.wiki".to_string(), "lseed.bitcoinstats.com".to_string()]
 }
 
 fn default_timeout_secs() -> u64 {
