@@ -29,7 +29,6 @@ Network options: `mainnet`, `testnet`, `regtest`, `signet` (default is `testnet`
 
 ### Example config
 
-<<<<<<< HEAD
 ```toml
 network = "testnet"
 
@@ -59,11 +58,11 @@ probe_delay_sec = 1
 peer_delay_sec = 2
 
 [dns_bootstrap]
-enabled=true
-seeds=[ "nodes.lightning.wiki", "lseed.bitcoinstats.com" ]
-timeout_secs=30
-num_peers=10
-interval_secs=300
+enabled = true
+seeds = [ "nodes.lightning.wiki", "lseed.bitcoinstats.com" ]
+timeout_secs = 30
+num_peers = 10
+interval_secs = 300
 ```
 
 ### Key options
