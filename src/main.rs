@@ -1317,16 +1317,20 @@ async fn start_ldk() {
 			sorted_amounts.sort();
 
 			let probe_timeout = Duration::from_secs(probe_config.timeout_sec);
+			let probe_delay = Duration::from_secs(probe_config.probe_delay_sec);
+			let peer_delay = Duration::from_secs(probe_config.peer_delay_sec);
 
 			// Log startup configuration
 			lightning::log_info!(
 				&*probing_logger,
-				"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s",
+				"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s, probe_delay={}s, peer_delay={}s",
 				probe_config.peers.len(),
 				sorted_amounts.len(),
 				sorted_amounts,
 				probe_config.interval_sec,
-				probe_config.timeout_sec
+				probe_config.timeout_sec,
+				probe_config.probe_delay_sec,
+				probe_config.peer_delay_sec
 			);
 
 			tokio::spawn(async move {
@@ -1336,7 +1340,8 @@ async fn start_ldk() {
 					interval.tick().await;
 
 					// Probe each peer with amounts from smallest to largest
-					for peer in &probe_config.peers {
+					let peer_count = probe_config.peers.len();
+					for (peer_idx, peer) in probe_config.peers.iter().enumerate() {
 						let peer_short = truncate_pubkey(peer);
 						'amounts: for &amount in &sorted_amounts {
 							// Send the probe and get the payment hash
@@ -1373,7 +1378,8 @@ async fn start_ldk() {
 											amount,
 											hash
 										);
-										// Probe succeeded, continue to next amount
+										// Probe succeeded, sleep before next amount
+										tokio::time::sleep(probe_delay).await;
 									},
 									Ok(Ok(ProbeOutcome::Failed)) => {
 										lightning::log_warn!(
@@ -1383,6 +1389,7 @@ async fn start_ldk() {
 											amount,
 											hash
 										);
+										tokio::time::sleep(probe_delay).await;
 										break 'amounts;
 									},
 									Ok(Err(_)) => {
@@ -1393,6 +1400,7 @@ async fn start_ldk() {
 											amount,
 											hash
 										);
+										tokio::time::sleep(probe_delay).await;
 										break 'amounts;
 									},
 									Err(_) => {
@@ -1409,6 +1417,7 @@ async fn start_ldk() {
 											.unwrap()
 											.pending_probes
 											.remove(&hash);
+										tokio::time::sleep(probe_delay).await;
 										break 'amounts;
 									},
 								}
@@ -1419,8 +1428,14 @@ async fn start_ldk() {
 									peer_short,
 									amount
 								);
+								tokio::time::sleep(probe_delay).await;
 								break 'amounts;
 							}
+						}
+
+						// Sleep between peers (except after the last peer)
+						if peer_idx < peer_count - 1 {
+							tokio::time::sleep(peer_delay).await;
 						}
 					}
 				}
