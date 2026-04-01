@@ -114,89 +114,136 @@ impl BitcoindClient {
 			client.fees.clone(),
 			client.bitcoind_rpc_client.clone(),
 			handle,
+			client.logger.clone(),
 		);
 		Ok(client)
 	}
 
 	fn poll_for_fee_estimates(
 		fees: Arc<HashMap<ConfirmationTarget, AtomicU32>>, rpc_client: Arc<RpcClient>,
-		handle: Handle,
+		handle: Handle, logger: Arc<FilesystemLogger>,
 	) {
 		handle.spawn(async move {
 			loop {
+				let load_current =
+					|target: ConfirmationTarget| fees.get(&target).unwrap().load(Ordering::Acquire);
+
 				let mempoolmin_estimate = {
-					let resp = rpc_client
+					match rpc_client
 						.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
 						.await
-						.unwrap();
-					match resp.feerate_sat_per_kw {
-						Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-						None => MIN_FEERATE,
+					{
+						Ok(resp) => match resp.feerate_sat_per_kw {
+							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+							None => MIN_FEERATE,
+						},
+						Err(e) => {
+							lightning::log_warn!(
+								&*logger,
+								"Fee polling getmempoolinfo failed: {}. Keeping previous value.",
+								e
+							);
+							load_current(ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
+						},
 					}
 				};
 				let background_estimate = {
 					let background_conf_target = serde_json::json!(144);
 					let background_estimate_mode = serde_json::json!("ECONOMICAL");
-					let resp = rpc_client
+					match rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
 							&[background_conf_target, background_estimate_mode],
 						)
 						.await
-						.unwrap();
-					match resp.feerate_sat_per_kw {
-						Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-						None => MIN_FEERATE,
+					{
+						Ok(resp) => match resp.feerate_sat_per_kw {
+							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+							None => MIN_FEERATE,
+						},
+						Err(e) => {
+							lightning::log_warn!(
+								&*logger,
+								"Fee polling background estimatesmartfee failed: {}. Keeping previous value.",
+								e
+							);
+							load_current(ConfirmationTarget::AnchorChannelFee)
+						},
 					}
 				};
 
 				let normal_estimate = {
 					let normal_conf_target = serde_json::json!(18);
 					let normal_estimate_mode = serde_json::json!("ECONOMICAL");
-					let resp = rpc_client
+					match rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
 							&[normal_conf_target, normal_estimate_mode],
 						)
 						.await
-						.unwrap();
-					match resp.feerate_sat_per_kw {
-						Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-						None => 2000,
+					{
+						Ok(resp) => match resp.feerate_sat_per_kw {
+							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+							None => 2000,
+						},
+						Err(e) => {
+							lightning::log_warn!(
+								&*logger,
+								"Fee polling normal estimatesmartfee failed: {}. Keeping previous value.",
+								e
+							);
+							load_current(ConfirmationTarget::NonAnchorChannelFee)
+						},
 					}
 				};
 
 				let high_prio_estimate = {
 					let high_prio_conf_target = serde_json::json!(6);
 					let high_prio_estimate_mode = serde_json::json!("CONSERVATIVE");
-					let resp = rpc_client
+					match rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
 							&[high_prio_conf_target, high_prio_estimate_mode],
 						)
 						.await
-						.unwrap();
-
-					match resp.feerate_sat_per_kw {
-						Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-						None => 5000,
+					{
+						Ok(resp) => match resp.feerate_sat_per_kw {
+							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+							None => 5000,
+						},
+						Err(e) => {
+							lightning::log_warn!(
+								&*logger,
+								"Fee polling high-priority estimatesmartfee failed: {}. Keeping previous value.",
+								e
+							);
+							load_current(ConfirmationTarget::UrgentOnChainSweep)
+						},
 					}
 				};
 
 				let very_high_prio_estimate = {
 					let high_prio_conf_target = serde_json::json!(2);
 					let high_prio_estimate_mode = serde_json::json!("CONSERVATIVE");
-					let resp = rpc_client
+					match rpc_client
 						.call_method::<FeeResponse>(
 							"estimatesmartfee",
 							&[high_prio_conf_target, high_prio_estimate_mode],
 						)
 						.await
-						.unwrap();
-
-					match resp.feerate_sat_per_kw {
-						Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-						None => 50000,
+					{
+						Ok(resp) => match resp.feerate_sat_per_kw {
+							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+							None => 50000,
+						},
+						Err(e) => {
+							lightning::log_warn!(
+								&*logger,
+								"Fee polling very-high-priority estimatesmartfee failed: {}. Keeping previous value.",
+								e
+							);
+							load_current(ConfirmationTarget::MaximumFeeEstimate)
+						},
 					}
 				};
 
@@ -211,7 +258,7 @@ impl BitcoindClient {
 					.store(mempoolmin_estimate, Ordering::Release);
 				fees.get(&ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee)
 					.unwrap()
-					.store(background_estimate - 250, Ordering::Release);
+					.store(background_estimate.saturating_sub(250), Ordering::Release);
 				fees.get(&ConfirmationTarget::AnchorChannelFee)
 					.unwrap()
 					.store(background_estimate, Ordering::Release);
@@ -342,7 +389,8 @@ impl BroadcasterInterface for BitcoindClient {
 			match res {
 				Ok(_) => {}
 				Err(e) => {
-					let err_str = e.get_ref().unwrap().to_string();
+					let err_str =
+						e.get_ref().map(|inner| inner.to_string()).unwrap_or_else(|| e.to_string());
 					log_error!(logger,
 						"Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\nTransactions: {:?}",
 						err_str,
