@@ -57,7 +57,7 @@ use lightning::util::sweep as ldk_sweep;
 use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_background_processor::{process_events_async, GossipSync, NO_LIQUIDITY_MANAGER};
 use lightning_block_sync::gossip::TokioSpawner;
-use lightning_block_sync::{init, poll, SpvClient, UnboundedCache};
+use lightning_block_sync::{init, poll, BlockSourceErrorKind, SpvClient, UnboundedCache};
 use lightning_dns_resolver::OMDomainResolver;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
@@ -1069,14 +1069,39 @@ async fn start_ldk() {
 	let output_sweeper_listener = output_sweeper.clone();
 	let bitcoind_block_source = bitcoind_client.clone();
 	let network = args.network;
+	let block_poll_logger = Arc::clone(&logger);
 	tokio::spawn(async move {
 		let chain_poller = poll::ChainPoller::new(bitcoind_block_source.as_ref(), network);
 		let chain_listener =
 			(chain_monitor_listener, &(channel_manager_listener, output_sweeper_listener));
 		let mut spv_client = SpvClient::new(chain_tip, chain_poller, &mut cache, &chain_listener);
+		let mut retry_delay = Duration::from_secs(1);
+		let max_retry_delay = Duration::from_secs(30);
 		loop {
-			spv_client.poll_best_tip().await.unwrap();
-			tokio::time::sleep(Duration::from_secs(1)).await;
+			match spv_client.poll_best_tip().await {
+				Ok(_) => {
+					retry_delay = Duration::from_secs(1);
+					tokio::time::sleep(Duration::from_secs(1)).await;
+				},
+				Err(e) => {
+					match e.kind() {
+						BlockSourceErrorKind::Transient => lightning::log_warn!(
+							&*block_poll_logger,
+							"SPV poll_best_tip transient error: {:?}. Retrying in {}s",
+							e,
+							retry_delay.as_secs()
+						),
+						BlockSourceErrorKind::Persistent => lightning::log_error!(
+							&*block_poll_logger,
+							"SPV poll_best_tip persistent error: {:?}. Retrying in {}s",
+							e,
+							retry_delay.as_secs()
+						),
+					}
+					tokio::time::sleep(retry_delay).await;
+					retry_delay = std::cmp::min(retry_delay + retry_delay, max_retry_delay);
+				},
+			}
 		}
 	});
 
@@ -1595,7 +1620,7 @@ pub async fn main() {
 			) {
 			}
 
-			new_action.sa_sigaction = dummy_handler as libc::sighandler_t;
+			new_action.sa_sigaction = dummy_handler as *const () as libc::sighandler_t;
 			new_action.sa_flags = libc::SA_SIGINFO;
 
 			libc::sigaction(
