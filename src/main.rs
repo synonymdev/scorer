@@ -1048,7 +1048,13 @@ async fn start_ldk() {
 			.expect("Failed to bind to listen port - is something else already listening on it?");
 		loop {
 			let peer_mgr = peer_manager_connection_handler.clone();
-			let tcp_stream = listener.accept().await.unwrap().0;
+			let (tcp_stream, _) = match listener.accept().await {
+				Ok(conn) => conn,
+				Err(e) => {
+					eprintln!("Failed to accept inbound connection: {}", e);
+					continue;
+				},
+			};
 			if stop_listen.load(Ordering::Acquire) {
 				return;
 			}
