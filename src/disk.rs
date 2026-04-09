@@ -1,27 +1,44 @@
 use crate::{InboundPaymentInfoStorage, NetworkGraph, OutboundPaymentInfoStorage};
 use bitcoin::Network;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
 use lightning::util::hash_tables::new_hash_map;
 use lightning::util::logger::{Level, Logger, Record};
 use lightning::util::ser::{Readable, ReadableArgs};
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub(crate) const INBOUND_PAYMENTS_FNAME: &str = "inbound_payments";
 pub(crate) const OUTBOUND_PAYMENTS_FNAME: &str = "outbound_payments";
 
+struct LogWriter {
+	file: BufWriter<File>,
+	current_date: NaiveDate,
+	logs_dir: String,
+}
+
+impl LogWriter {
+	fn open_log_file(logs_dir: &str, date: NaiveDate) -> std::io::Result<BufWriter<File>> {
+		let path = format!("{}/logs-{}.txt", logs_dir, date.format("%Y-%m-%d"));
+		let file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+		Ok(BufWriter::new(file))
+	}
+}
+
 pub(crate) struct FilesystemLogger {
-	data_dir: String,
+	writer: Mutex<LogWriter>,
 }
 impl FilesystemLogger {
 	pub(crate) fn new(data_dir: String) -> Self {
-		let logs_path = format!("{}/logs", data_dir);
-		fs::create_dir_all(logs_path.clone()).unwrap();
-		Self { data_dir: logs_path }
+		let logs_dir = format!("{}/logs", data_dir);
+		fs::create_dir_all(logs_dir.clone()).unwrap();
+		let today = Utc::now().date_naive();
+		let file =
+			LogWriter::open_log_file(&logs_dir, today).expect("Failed to open initial log file");
+		Self { writer: Mutex::new(LogWriter { file, current_date: today, logs_dir }) }
 	}
 }
 impl Logger for FilesystemLogger {
@@ -30,26 +47,36 @@ impl Logger for FilesystemLogger {
 			// Gossip-level logs are incredibly verbose, and thus we skip them by default.
 			return;
 		}
+		let now = Utc::now();
 		let raw_log = record.args.to_string();
 		let log = format!(
 			"{} {:<5} [{}:{}] {}\n",
 			// Note that a "real" lightning node almost certainly does *not* want subsecond
 			// precision for message-receipt information as it makes log entries a target for
 			// deanonymization attacks. For testing, however, its quite useful.
-			Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+			now.format("%Y-%m-%d %H:%M:%S%.3f"),
 			record.level.to_string(),
 			record.module_path,
 			record.line,
 			raw_log
 		);
-		let logs_file_path = format!("{}/logs.txt", self.data_dir.clone());
-		fs::OpenOptions::new()
-			.create(true)
-			.append(true)
-			.open(logs_file_path)
-			.unwrap()
-			.write_all(log.as_bytes())
-			.unwrap();
+		let Ok(mut writer) = self.writer.lock() else {
+			// Mutex poisoned — another thread panicked while holding it.
+			// Falling back to stderr is the safest option; never panic in a logger.
+			eprintln!("{}", log);
+			return;
+		};
+		// Daily rotation: if the date has changed, open a new log file.
+		let today = now.date_naive();
+		if today != writer.current_date {
+			if let Ok(new_file) = LogWriter::open_log_file(&writer.logs_dir, today) {
+				writer.file = new_file;
+				writer.current_date = today;
+			}
+			// If the new file can't be opened, keep writing to the old one.
+		}
+		let _ = writer.file.write_all(log.as_bytes());
+		let _ = writer.file.flush();
 	}
 }
 
