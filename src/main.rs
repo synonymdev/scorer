@@ -781,7 +781,7 @@ async fn start_ldk() {
 	let event_handler = move |event: Event| {
 		let event_context = Arc::clone(&event_context);
 		async move {
-			events::handle_ldk_events(event_context.as_ref().clone(), event).await;
+			events::handle_ldk_events(event_context, event).await;
 			Ok(())
 		}
 	};

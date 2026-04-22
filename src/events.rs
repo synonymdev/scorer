@@ -39,21 +39,19 @@ pub(crate) struct EventContext {
 	pub(crate) probe_tracker: Arc<Mutex<ProbeTracker>>,
 }
 
-pub(crate) async fn handle_ldk_events(ctx: EventContext, event: Event) {
-	let EventContext {
-		channel_manager,
-		bitcoind_client,
-		network_graph,
-		keys_manager,
-		bump_tx_event_handler,
-		peer_manager,
-		inbound_payments,
-		outbound_payments,
-		fs_store,
-		output_sweeper,
-		network,
-		probe_tracker,
-	} = ctx;
+pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
+	let channel_manager = &ctx.channel_manager;
+	let bitcoind_client = &ctx.bitcoind_client;
+	let network_graph = &ctx.network_graph;
+	let keys_manager = &ctx.keys_manager;
+	let bump_tx_event_handler = &ctx.bump_tx_event_handler;
+	let peer_manager = &ctx.peer_manager;
+	let inbound_payments = &ctx.inbound_payments;
+	let outbound_payments = &ctx.outbound_payments;
+	let fs_store = &ctx.fs_store;
+	let output_sweeper = &ctx.output_sweeper;
+	let network = ctx.network;
+	let probe_tracker = &ctx.probe_tracker;
 
 	match event {
 		Event::FundingGenerationReady {
@@ -348,6 +346,7 @@ pub(crate) async fn handle_ldk_events(ctx: EventContext, event: Event) {
 		Event::OnionMessagePeerConnected { .. } => {},
 		Event::BumpTransaction(event) => bump_tx_event_handler.handle_event(&event).await,
 		Event::ConnectionNeeded { node_id, addresses } => {
+			let peer_manager = Arc::clone(peer_manager);
 			tokio::spawn(async move {
 				for address in addresses {
 					if let Ok(sockaddrs) = address.to_socket_addrs() {
