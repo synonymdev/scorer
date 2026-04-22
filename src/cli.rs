@@ -566,6 +566,7 @@ pub(crate) async fn poll_for_user_input(
 				"nodeinfo" => {
 					node_info(&channel_manager, &chain_monitor, &peer_manager, &network_graph)
 				},
+				"listclaimablebalances" => list_claimable_balances(&chain_monitor),
 				"listsweeperoutputs" => list_sweeper_outputs(&output_sweeper),
 				"listpeers" => list_peers(peer_manager.clone()),
 				"signmessage" => {
@@ -618,7 +619,29 @@ fn help() {
 	println!("\n  Other:");
 	println!("      signmessage <message>");
 	println!("      nodeinfo");
+	println!("      listclaimablebalances");
 	println!("      listsweeperoutputs");
+}
+
+fn list_claimable_balances(chain_monitor: &Arc<ChainMonitor>) {
+	let balances = chain_monitor.get_claimable_balances(&[]);
+	if balances.is_empty() {
+		println!("No claimable balances.");
+		return;
+	}
+
+	let total_claimable_sats =
+		balances.iter().map(|balance| balance.claimable_amount_satoshis()).sum::<u64>();
+	println!("Claimable balances: {} (total={} sats)", balances.len(), total_claimable_sats);
+	print!("[");
+	for balance in balances {
+		println!();
+		println!("\t{{");
+		println!("\t\tclaimable_amount_satoshis: {},", balance.claimable_amount_satoshis());
+		println!("\t\tdetails: {:?},", balance);
+		println!("\t}},");
+	}
+	println!("]");
 }
 
 fn descriptor_kind_and_outpoint(
