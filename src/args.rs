@@ -30,6 +30,18 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 			crate::config::print_config_help();
 			return Err(());
 		},
+		Err(crate::config::ConfigError::DeprecatedJsonConfig(path)) => {
+			println!(
+				"ERROR: Deprecated config file detected at {}. config.json is no longer supported.",
+				path
+			);
+			println!(
+				"Please migrate to <ldk_storage_directory_path>/.ldk/config.toml using config.example.toml as a template."
+			);
+			println!();
+			crate::config::print_config_help();
+			return Err(());
+		},
 		Err(crate::config::ConfigError::ParseError(msg)) => {
 			println!("ERROR: {}", msg);
 			println!();
