@@ -21,6 +21,8 @@ Use `config.example.toml` in the repo root as a template for your config file.
 Config is loaded from `<storage_dir>/.ldk/config.toml` and strictly validated. Unknown
 fields cause an error (`deny_unknown_fields`).
 
+`config.json` is deprecated and no longer supported.
+
 Required sections: `bitcoind`.
 Optional sections: `ldk`, `rapid_gossip_sync`, `probing` (probing is disabled if
 missing), and `dns_bootstrap` (enabled by default with sensible defaults).

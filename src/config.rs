@@ -10,6 +10,7 @@ use std::str::FromStr;
 #[derive(Debug)]
 pub enum ConfigError {
 	FileNotFound(String),
+	DeprecatedJsonConfig(String),
 	ParseError(String),
 	ValidationError(String),
 }
@@ -121,7 +122,11 @@ impl Default for RapidGossipSyncConfig {
 impl NodeConfig {
 	pub fn load(ldk_data_dir: &str) -> Result<Self, ConfigError> {
 		let config_path = format!("{}/config.toml", ldk_data_dir);
+		let deprecated_json_path = format!("{}/config.json", ldk_data_dir);
 		if !Path::new(&config_path).exists() {
+			if Path::new(&deprecated_json_path).exists() {
+				return Err(ConfigError::DeprecatedJsonConfig(deprecated_json_path));
+			}
 			return Err(ConfigError::FileNotFound(config_path));
 		}
 		let content = fs::read_to_string(&config_path)
@@ -230,6 +235,8 @@ impl NodeConfig {
 pub fn print_config_help() {
 	println!("ERROR: Config file not found or invalid.");
 	println!();
+	println!("NOTE: config.json is deprecated and no longer supported.");
+	println!();
 	println!(
 		"Please create a config.toml file in your LDK data directory with the following structure:"
 	);
@@ -271,4 +278,77 @@ interval_secs = 300
 
 "#
 	);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ConfigError, NodeConfig};
+	use std::fs;
+	use tempfile::TempDir;
+
+	fn write_file(path: &std::path::Path, content: &str) {
+		fs::write(path, content).expect("failed to write test file");
+	}
+
+	#[test]
+	fn load_reads_toml_config() {
+		let tmp = TempDir::new().expect("failed to create temp dir");
+		let config_path = tmp.path().join("config.toml");
+		write_file(
+			&config_path,
+			r#"[bitcoind]
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+rpc_username = "user"
+rpc_password = "pass"
+"#,
+		);
+
+		let cfg = NodeConfig::load(tmp.path().to_str().unwrap());
+		assert!(cfg.is_ok());
+	}
+
+	#[test]
+	fn load_fails_with_deprecated_json_when_toml_missing() {
+		let tmp = TempDir::new().expect("failed to create temp dir");
+		let json_path = tmp.path().join("config.json");
+		write_file(
+			&json_path,
+			r#"{
+  "bitcoind": {
+    "rpc_host": "127.0.0.1",
+    "rpc_port": 8332,
+    "rpc_username": "user",
+    "rpc_password": "pass"
+  }
+}"#,
+		);
+
+		let err = match NodeConfig::load(tmp.path().to_str().unwrap()) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => e,
+		};
+		match err {
+			ConfigError::DeprecatedJsonConfig(path) => {
+				assert!(path.ends_with("config.json"));
+			},
+			other => panic!("expected DeprecatedJsonConfig, got {:?}", other),
+		}
+	}
+
+	#[test]
+	fn load_fails_when_no_config_files_exist() {
+		let tmp = TempDir::new().expect("failed to create temp dir");
+
+		let err = match NodeConfig::load(tmp.path().to_str().unwrap()) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => e,
+		};
+		match err {
+			ConfigError::FileNotFound(path) => {
+				assert!(path.ends_with("config.toml"));
+			},
+			other => panic!("expected FileNotFound, got {:?}", other),
+		}
+	}
 }
