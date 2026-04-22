@@ -25,7 +25,7 @@ pub(crate) struct ProbingDeps {
 	pub(crate) tracker: Arc<Mutex<ProbeTracker>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ProbeOutcome {
 	Success,
 	Failed,
@@ -33,16 +33,23 @@ enum ProbeOutcome {
 
 pub(crate) struct ProbeTracker {
 	pending_probes: StdHashMap<PaymentHash, tokio::sync::oneshot::Sender<ProbeOutcome>>,
+	completed_probes: StdHashMap<PaymentHash, ProbeOutcome>,
 }
 
 impl ProbeTracker {
 	pub(crate) fn new() -> Self {
-		Self { pending_probes: StdHashMap::new() }
+		Self { pending_probes: StdHashMap::new(), completed_probes: StdHashMap::new() }
 	}
 
 	fn register_probe(
 		&mut self, payment_hash: PaymentHash,
 	) -> tokio::sync::oneshot::Receiver<ProbeOutcome> {
+		if let Some(outcome) = self.completed_probes.remove(&payment_hash) {
+			let (tx, rx) = tokio::sync::oneshot::channel();
+			let _ = tx.send(outcome);
+			return rx;
+		}
+
 		let (tx, rx) = tokio::sync::oneshot::channel();
 		self.pending_probes.insert(payment_hash, tx);
 		rx
@@ -58,12 +65,56 @@ impl ProbeTracker {
 
 	pub(crate) fn remove_pending(&mut self, payment_hash: &PaymentHash) {
 		self.pending_probes.remove(payment_hash);
+		self.completed_probes.remove(payment_hash);
 	}
 
 	fn complete_probe(&mut self, payment_hash: &PaymentHash, outcome: ProbeOutcome) {
 		if let Some(sender) = self.pending_probes.remove(payment_hash) {
 			let _ = sender.send(outcome);
+		} else {
+			self.completed_probes.insert(payment_hash.clone(), outcome);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ProbeOutcome, ProbeTracker};
+	use lightning::types::payment::PaymentHash;
+	use tokio::sync::oneshot::error::TryRecvError;
+
+	#[test]
+	fn complete_before_register_delivers_buffered_success() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([1; 32]);
+
+		tracker.complete_success(&hash);
+
+		let mut rx = tracker.register_probe(hash);
+		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Success)));
+	}
+
+	#[test]
+	fn complete_before_register_delivers_buffered_failed() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([2; 32]);
+
+		tracker.complete_failed(&hash);
+
+		let mut rx = tracker.register_probe(hash);
+		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Failed)));
+	}
+
+	#[test]
+	fn register_before_complete_still_delivers_over_channel() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([3; 32]);
+
+		let mut rx = tracker.register_probe(hash);
+		assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+		tracker.complete_success(&hash);
+		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Success)));
 	}
 }
 
