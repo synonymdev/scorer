@@ -43,6 +43,8 @@ pub(crate) struct ProbingConfig {
 	pub(crate) interval_sec: u64,
 	pub(crate) peers: Vec<String>,
 	pub(crate) amount_msats: Vec<u64>,
+	pub(crate) random_min_amount_msat: u64,
+	pub(crate) random_nodes_per_interval: u64,
 	pub(crate) timeout_sec: u64,
 	pub(crate) probe_delay_sec: u64,
 	pub(crate) peer_delay_sec: u64,

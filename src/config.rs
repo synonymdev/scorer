@@ -63,6 +63,10 @@ pub struct ProbingConfig {
 	pub interval_sec: u64,
 	pub peers: Vec<String>,
 	pub amount_msats: Vec<u64>,
+	#[serde(default = "default_random_min_probe_amount")]
+	pub random_min_amount_msat: u64,
+	#[serde(default = "default_random_nodes_per_interval")]
+	pub random_nodes_per_interval: u64,
 	#[serde(default = "default_probe_timeout")]
 	pub timeout_sec: u64,
 	#[serde(default = "default_probe_delay")]
@@ -98,6 +102,14 @@ fn default_probe_delay() -> u64 {
 
 fn default_peer_delay() -> u64 {
 	2
+}
+
+fn default_random_min_probe_amount() -> u64 {
+	0
+}
+
+fn default_random_nodes_per_interval() -> u64 {
+	1
 }
 
 impl Default for RapidGossipSyncConfig {
@@ -190,6 +202,8 @@ impl NodeConfig {
 			interval_sec: p.interval_sec,
 			peers: p.peers,
 			amount_msats: p.amount_msats,
+			random_min_amount_msat: p.random_min_amount_msat,
+			random_nodes_per_interval: p.random_nodes_per_interval,
 			timeout_sec: p.timeout_sec,
 			probe_delay_sec: p.probe_delay_sec,
 			peer_delay_sec: p.peer_delay_sec,
@@ -242,6 +256,8 @@ interval_hours = 6
 interval_sec = 300
 peers = []
 amount_msats = [1000, 10000, 100000]
+random_min_amount_msat = 1000
+random_nodes_per_interval = 1
 timeout_sec = 60
 probe_delay_sec = 1
 peer_delay_sec = 2
