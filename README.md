@@ -52,6 +52,8 @@ interval_hours = 6
 interval_sec = 300
 peers = ["02abc123...@1.2.3.4:9735"]
 amount_msats = [1000, 10000, 100000, 1000000]
+random_min_amount_msat = 1000
+random_nodes_per_interval = 1
 timeout_sec = 60
 
 probe_delay_sec = 1
@@ -85,8 +87,12 @@ fails, the node falls back to P2P gossip sync. `url` defaults to
 `https://rapidsync.lightningdevkit.org/snapshot/`, `interval_hours` defaults to 6.
 
 `probing`:
-Optional. If omitted, probing is disabled. Configure probe interval, peers, probe
-amounts in millisatoshis, and timeout.
+Optional. If omitted, probing is disabled. Peer-list probing uses `peers` +
+`amount_msats` and probes each configured peer with incrementally increasing amounts.
+Random-graph probing uses `random_min_amount_msat` and
+`random_nodes_per_interval` to probe randomly selected graph nodes at a fixed
+minimal amount each interval. Set `random_min_amount_msat = 0` to disable
+random-graph probing.
 
 `dns_bootstrap`:
 Optional. Enabled by default. Discovers peers via DNS SRV lookups per BOLT-0010.

@@ -22,6 +22,8 @@ peers = [
     "02abc123...@1.2.3.4:9735"
 ]
 amount_msats = [1000, 10000, 100000, 1000000]
+random_min_amount_msat = 1000
+random_nodes_per_interval = 1
 timeout_sec = 60
 probe_delay_sec = 1
 peer_delay_sec = 2

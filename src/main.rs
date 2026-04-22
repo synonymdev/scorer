@@ -1464,10 +1464,37 @@ async fn start_ldk() {
 	let probing_scorer = Arc::clone(&scorer);
 	let probing_tracker = Arc::clone(&probe_tracker);
 	if let Some(probe_config) = probing_config {
-		if probe_config.peers.is_empty() {
-			println!("WARNING: probing.peers is empty in config.toml. Probing disabled.");
-		} else if probe_config.amount_msats.is_empty() {
-			println!("WARNING: probing.amount_msats is empty in config.toml. Probing disabled.");
+		let has_peer_targets = !probe_config.peers.is_empty();
+		let has_peer_amounts = !probe_config.amount_msats.is_empty();
+		let peer_probing_enabled = has_peer_targets && has_peer_amounts;
+		let random_amount_enabled = probe_config.random_min_amount_msat > 0;
+		let random_count_enabled = probe_config.random_nodes_per_interval > 0;
+		let random_probing_enabled = random_amount_enabled && random_count_enabled;
+
+		if !peer_probing_enabled {
+			if !has_peer_targets && has_peer_amounts {
+				println!(
+					"WARNING: probing.peers is empty in config.toml. Peer-list probing disabled."
+				);
+			} else if has_peer_targets && !has_peer_amounts {
+				println!(
+					"WARNING: probing.amount_msats is empty in config.toml. Peer-list probing disabled."
+				);
+			}
+		}
+
+		if !random_probing_enabled {
+			if random_amount_enabled && !random_count_enabled {
+				println!(
+					"WARNING: probing.random_nodes_per_interval is 0 in config.toml. Random-graph probing disabled."
+				);
+			}
+		}
+
+		if !peer_probing_enabled && !random_probing_enabled {
+			println!(
+				"WARNING: probing config does not enable any probing mode. Probing disabled."
+			);
 		} else {
 			// Sort amounts ascending (smallest to largest)
 			let mut sorted_amounts = probe_config.amount_msats.clone();
@@ -1480,10 +1507,14 @@ async fn start_ldk() {
 			// Log startup configuration
 			lightning::log_info!(
 				&*probing_logger,
-				"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s, probe_delay={}s, peer_delay={}s",
+				"Probing started: peer_list_mode={} ({} peers, {} amounts {:?} msat), random_graph_mode={} ({} nodes/interval at {} msat), interval={}s, timeout={}s, probe_delay={}s, peer_delay={}s",
+				peer_probing_enabled,
 				probe_config.peers.len(),
 				sorted_amounts.len(),
 				sorted_amounts,
+				random_probing_enabled,
+				probe_config.random_nodes_per_interval,
+				probe_config.random_min_amount_msat,
 				probe_config.interval_sec,
 				probe_config.timeout_sec,
 				probe_config.probe_delay_sec,
@@ -1493,188 +1524,383 @@ async fn start_ldk() {
 			tokio::spawn(async move {
 				let mut interval =
 					tokio::time::interval(Duration::from_secs(probe_config.interval_sec));
+				let our_node_id = NodeId::from_pubkey(&probing_cm.get_our_node_id());
+
 				loop {
 					interval.tick().await;
 
-					// Probe each peer with amounts from smallest to largest
-					let peer_count = probe_config.peers.len();
-					for (peer_idx, peer) in probe_config.peers.iter().enumerate() {
-						let Some(peer_pubkey) = extract_peer_pubkey(peer) else {
+					if peer_probing_enabled {
+						let peer_count = probe_config.peers.len();
+						for (peer_idx, peer) in probe_config.peers.iter().enumerate() {
+							let Some(peer_pubkey) = extract_peer_pubkey(peer) else {
+								lightning::log_warn!(
+									&*probing_logger,
+									"Probe skipped: invalid peer entry '{}' (expected pubkey@host:port or pubkey)",
+									peer
+								);
+								continue;
+							};
+							let destination_node = peer_pubkey;
+							let peer_short = truncate_pubkey(peer_pubkey);
+							'amounts: for &amount in &sorted_amounts {
+								let payment_hash = prepare_probe(
+									&probing_cm,
+									&probing_graph,
+									&probing_logger,
+									&probing_scorer,
+									peer_pubkey,
+									amount,
+								);
+
+								match payment_hash {
+									Ok(hash) => {
+										lightning::log_info!(
+											&*probing_logger,
+											"Probe SENT to {} for {} msat (hash: {})",
+											peer_short,
+											amount,
+											hash
+										);
+
+										let rx = probing_tracker.lock().unwrap().register_probe(hash);
+										let outcome = tokio::time::timeout(probe_timeout, rx).await;
+
+										match outcome {
+											Ok(Ok(ProbeOutcome::Success)) => {
+												lightning::log_info!(
+													&*probing_logger,
+													"Probe SUCCESS to {} for {} msat (hash: {})",
+													peer_short,
+													amount,
+													hash
+												);
+												lightning::log_info!(
+													&*probing_logger,
+													"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+													destination_node,
+													amount,
+													hash
+												);
+												tokio::time::sleep(probe_delay).await;
+											},
+											Ok(Ok(ProbeOutcome::Failed)) => {
+												lightning::log_warn!(
+													&*probing_logger,
+													"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
+													peer_short,
+													amount,
+													hash
+												);
+												lightning::log_warn!(
+													&*probing_logger,
+													"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
+													destination_node,
+													amount,
+													hash
+												);
+												tokio::time::sleep(probe_delay).await;
+												break 'amounts;
+											},
+											Ok(Err(_)) => {
+												lightning::log_warn!(
+													&*probing_logger,
+													"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
+													peer_short,
+													amount,
+													hash
+												);
+												lightning::log_warn!(
+													&*probing_logger,
+													"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+													destination_node,
+													amount,
+													hash
+												);
+												tokio::time::sleep(probe_delay).await;
+												break 'amounts;
+											},
+											Err(_) => {
+												lightning::log_warn!(
+													&*probing_logger,
+													"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
+													peer_short,
+													amount,
+													hash
+												);
+												lightning::log_warn!(
+													&*probing_logger,
+													"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+													destination_node,
+													amount,
+													hash
+												);
+												probing_tracker
+													.lock()
+													.unwrap()
+													.pending_probes
+													.remove(&hash);
+												tokio::time::sleep(probe_delay).await;
+												break 'amounts;
+											},
+										}
+									},
+									Err(ProbeError::NoRoute(err)) => {
+										lightning::log_warn!(
+											&*probing_logger,
+											"Probe NO_ROUTE to {} for {} msat (error: {}), skipping remaining amounts",
+											peer_short,
+											amount,
+											err
+										);
+										lightning::log_warn!(
+											&*probing_logger,
+											"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
+											destination_node,
+											amount,
+											err
+										);
+										tokio::time::sleep(probe_delay).await;
+										break 'amounts;
+									},
+									Err(ProbeError::SendFailed(err)) => {
+										lightning::log_warn!(
+											&*probing_logger,
+											"Probe SEND_FAILED to {} for {} msat (error: {:?}), skipping remaining amounts",
+											peer_short,
+											amount,
+											err
+										);
+										lightning::log_warn!(
+											&*probing_logger,
+											"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
+											destination_node,
+											amount,
+											err
+										);
+										tokio::time::sleep(probe_delay).await;
+										break 'amounts;
+									},
+									Err(ProbeError::InvalidInput(err)) => {
+										lightning::log_warn!(
+											&*probing_logger,
+											"Probe INVALID_INPUT to {} for {} msat (error: {}), skipping remaining amounts",
+											peer_short,
+											amount,
+											err
+										);
+										lightning::log_warn!(
+											&*probing_logger,
+											"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
+											destination_node,
+											amount,
+											err
+										);
+										tokio::time::sleep(probe_delay).await;
+										break 'amounts;
+									},
+								}
+							}
+
+							if peer_idx < peer_count - 1 {
+								tokio::time::sleep(peer_delay).await;
+							}
+						}
+					}
+
+					if random_probing_enabled {
+						let mut random_candidates = Vec::new();
+						{
+							let graph_read_only = probing_graph.read_only();
+							for (node_id, _node_info) in graph_read_only.nodes().unordered_iter() {
+								if *node_id == our_node_id {
+									continue;
+								}
+								if let Ok(pubkey) = node_id.as_pubkey() {
+									random_candidates.push(pubkey);
+								}
+							}
+						}
+
+						if random_candidates.is_empty() {
 							lightning::log_warn!(
 								&*probing_logger,
-								"Probe skipped: invalid peer entry '{}' (expected pubkey@host:port or pubkey)",
-								peer
+								"Random probe skipped: no graph nodes available"
 							);
 							continue;
+						}
+
+						let random_recipients = {
+							let mut rng = thread_rng();
+							rng.shuffle(&mut random_candidates);
+
+							let requested_count = probe_config
+								.random_nodes_per_interval
+								.try_into()
+								.unwrap_or(usize::MAX);
+							let random_probe_count =
+								std::cmp::min(requested_count, random_candidates.len());
+
+							random_candidates
+								.into_iter()
+								.take(random_probe_count)
+								.collect::<Vec<_>>()
 						};
-						'amounts: for &amount in &sorted_amounts {
-							// Send the probe and get the payment hash
-							let payment_hash = prepare_probe(
+
+						for recipient in random_recipients {
+							let recipient_hex = hex_utils::hex_str(&recipient.serialize());
+							let destination_node = recipient_hex.as_str();
+							let peer_short = truncate_pubkey(&recipient_hex);
+							let amount = probe_config.random_min_amount_msat;
+							let payment_hash = send_probe(
 								&probing_cm,
+								recipient,
 								&probing_graph,
 								&probing_logger,
-								&probing_scorer,
-								peer_pubkey,
 								amount,
+								&probing_scorer,
 							);
 
 							match payment_hash {
 								Ok(hash) => {
 									lightning::log_info!(
 										&*probing_logger,
-										"Probe SENT to {} for {} msat (hash: {})",
-										peer_pubkey,
+										"Random probe SENT to {} for {} msat (hash: {})",
+										peer_short,
 										amount,
 										hash
 									);
 
-									// Register the probe and get a receiver for the outcome
 									let rx = probing_tracker.lock().unwrap().register_probe(hash);
-
-									// Wait for the probe outcome with timeout
 									let outcome = tokio::time::timeout(probe_timeout, rx).await;
 
 									match outcome {
 										Ok(Ok(ProbeOutcome::Success)) => {
 											lightning::log_info!(
 												&*probing_logger,
-												"Probe SUCCESS to {} for {} msat (hash: {})",
-												peer_pubkey,
+												"Random probe SUCCESS to {} for {} msat (hash: {})",
+												peer_short,
 												amount,
 												hash
 											);
 											lightning::log_info!(
 												&*probing_logger,
 												"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
-												peer_pubkey,
+												destination_node,
 												amount,
 												hash
 											);
-											// Probe succeeded, sleep before next amount
 											tokio::time::sleep(probe_delay).await;
 										},
 										Ok(Ok(ProbeOutcome::Failed)) => {
 											lightning::log_warn!(
 												&*probing_logger,
-												"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
-												peer_pubkey,
+												"Random probe FAILED to {} for {} msat (hash: {})",
+												peer_short,
 												amount,
 												hash
 											);
 											lightning::log_warn!(
 												&*probing_logger,
 												"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
-												peer_pubkey,
+												destination_node,
 												amount,
 												hash
 											);
 											tokio::time::sleep(probe_delay).await;
-											break 'amounts;
 										},
 										Ok(Err(_)) => {
 											lightning::log_warn!(
 												&*probing_logger,
-												"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
-												peer_pubkey,
+												"Random probe DROPPED to {} for {} msat (hash: {}), channel closed",
+												peer_short,
 												amount,
 												hash
 											);
 											lightning::log_warn!(
 												&*probing_logger,
 												"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
-												peer_pubkey,
+												destination_node,
 												amount,
 												hash
 											);
 											tokio::time::sleep(probe_delay).await;
-											break 'amounts;
 										},
 										Err(_) => {
 											lightning::log_warn!(
 												&*probing_logger,
-												"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
-												peer_pubkey,
+												"Random probe TIMEOUT to {} for {} msat (hash: {})",
+												peer_short,
 												amount,
 												hash
 											);
 											lightning::log_warn!(
 												&*probing_logger,
 												"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
-												peer_pubkey,
+												destination_node,
 												amount,
 												hash
 											);
-											// Clean up the pending probe to avoid memory leak
 											probing_tracker
 												.lock()
 												.unwrap()
 												.pending_probes
 												.remove(&hash);
 											tokio::time::sleep(probe_delay).await;
-											break 'amounts;
 										},
 									}
 								},
 								Err(ProbeError::NoRoute(err)) => {
 									lightning::log_warn!(
 										&*probing_logger,
-										"Probe NO_ROUTE to {} for {} msat (error: {}), skipping remaining amounts",
-										peer_pubkey,
+										"Random probe NO_ROUTE to {} for {} msat (error: {})",
+										peer_short,
 										amount,
 										err
 									);
 									lightning::log_warn!(
 										&*probing_logger,
 										"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
-										peer_pubkey,
+										destination_node,
 										amount,
 										err
 									);
 									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
 								},
 								Err(ProbeError::SendFailed(err)) => {
 									lightning::log_warn!(
 										&*probing_logger,
-										"Probe SEND_FAILED to {} for {} msat (error: {:?}), skipping remaining amounts",
-										peer_pubkey,
+										"Random probe SEND_FAILED to {} for {} msat (error: {:?})",
+										peer_short,
 										amount,
 										err
 									);
 									lightning::log_warn!(
 										&*probing_logger,
 										"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
-										peer_pubkey,
+										destination_node,
 										amount,
 										err
 									);
 									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
 								},
 								Err(ProbeError::InvalidInput(err)) => {
 									lightning::log_warn!(
 										&*probing_logger,
-										"Probe INVALID_INPUT to {} for {} msat (error: {}), skipping remaining amounts",
-										peer_pubkey,
+										"Random probe INVALID_INPUT to {} for {} msat (error: {})",
+										peer_short,
 										amount,
 										err
 									);
 									lightning::log_warn!(
 										&*probing_logger,
 										"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
-										peer_pubkey,
+										destination_node,
 										amount,
 										err
 									);
 									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
 								},
 							}
-						}
-
-						// Sleep between peers (except after the last peer)
-						if peer_idx < peer_count - 1 {
-							tokio::time::sleep(peer_delay).await;
 						}
 					}
 				}
