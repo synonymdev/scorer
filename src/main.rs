@@ -1430,6 +1430,7 @@ async fn start_ldk() {
 					// Probe each peer with amounts from smallest to largest
 					let peer_count = probe_config.peers.len();
 					for (peer_idx, peer) in probe_config.peers.iter().enumerate() {
+						let destination_node = peer.split('@').next().unwrap_or(peer);
 						let peer_short = truncate_pubkey(peer);
 						'amounts: for &amount in &sorted_amounts {
 							// Send the probe and get the payment hash
@@ -1466,6 +1467,13 @@ async fn start_ldk() {
 											amount,
 											hash
 										);
+										lightning::log_info!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+										destination_node,
+										amount,
+										hash
+									);
 										// Probe succeeded, sleep before next amount
 										tokio::time::sleep(probe_delay).await;
 									},
@@ -1476,7 +1484,14 @@ async fn start_ldk() {
 											peer_short,
 											amount,
 											hash
-										);
+									);
+										lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
+										destination_node,
+										amount,
+										hash
+									);
 										tokio::time::sleep(probe_delay).await;
 										break 'amounts;
 									},
@@ -1487,7 +1502,14 @@ async fn start_ldk() {
 											peer_short,
 											amount,
 											hash
-										);
+									);
+										lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+										destination_node,
+										amount,
+										hash
+									);
 										tokio::time::sleep(probe_delay).await;
 										break 'amounts;
 									},
@@ -1498,7 +1520,14 @@ async fn start_ldk() {
 											peer_short,
 											amount,
 											hash
-										);
+									);
+										lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+										destination_node,
+										amount,
+										hash
+									);
 										// Clean up the pending probe to avoid memory leak
 										probing_tracker
 											.lock()
@@ -1514,6 +1543,12 @@ async fn start_ldk() {
 									&*probing_logger,
 									"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
 									peer_short,
+									amount
+								);
+								lightning::log_warn!(
+									&*probing_logger,
+									"probe_completed destination_node={} amount_msat={} state=NO_ROUTE",
+									destination_node,
 									amount
 								);
 								tokio::time::sleep(probe_delay).await;
