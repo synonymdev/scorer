@@ -125,6 +125,8 @@ mod tests {
 		ProbeOutcome, ProbeTracker, MAX_TIMED_OUT_PROBES, TIMED_OUT_PROBE_TTL,
 	};
 	use lightning::types::payment::PaymentHash;
+	use rand::thread_rng;
+	use std::collections::HashSet;
 	use std::time::{Duration, Instant};
 	use tokio::sync::oneshot::error::TryRecvError;
 
@@ -222,6 +224,35 @@ mod tests {
 		assert_eq!(super::extract_peer_pubkey("@1.2.3.4:9735"), None);
 		assert_eq!(super::extract_peer_pubkey("   "), None);
 	}
+
+	#[test]
+	fn reservoir_sample_is_bounded_and_unique() {
+		let mut rng = thread_rng();
+		let sample = super::reservoir_sample(0..100usize, 8, &mut rng);
+
+		assert_eq!(sample.len(), 8);
+		assert!(sample.iter().all(|value| *value < 100));
+		let unique = sample.iter().copied().collect::<HashSet<_>>();
+		assert_eq!(unique.len(), sample.len());
+	}
+
+	#[test]
+	fn reservoir_sample_returns_all_when_k_exceeds_population() {
+		let mut rng = thread_rng();
+		let sample = super::reservoir_sample(vec![1usize, 2, 3], 10, &mut rng);
+
+		assert_eq!(sample.len(), 3);
+		let values = sample.into_iter().collect::<HashSet<_>>();
+		assert_eq!(values, HashSet::from([1usize, 2, 3]));
+	}
+
+	#[test]
+	fn reservoir_sample_returns_empty_when_no_candidates() {
+		let mut rng = thread_rng();
+		let sample = super::reservoir_sample(Vec::<usize>::new(), 5, &mut rng);
+
+		assert!(sample.is_empty());
+	}
 }
 
 fn truncate_pubkey(pubkey: &str) -> String {
@@ -239,6 +270,34 @@ fn extract_peer_pubkey(peer: &str) -> Option<&str> {
 	} else {
 		Some(pubkey)
 	}
+}
+
+fn reservoir_sample<T, I, R>(candidates: I, sample_size: usize, rng: &mut R) -> Vec<T>
+where
+	I: IntoIterator<Item = T>,
+	R: Rng,
+{
+	if sample_size == 0 {
+		return Vec::new();
+	}
+
+	let mut reservoir = Vec::with_capacity(sample_size);
+	let mut seen = 0usize;
+
+	for candidate in candidates {
+		seen += 1;
+		if reservoir.len() < sample_size {
+			reservoir.push(candidate);
+			continue;
+		}
+
+		let replace_idx = rng.gen_range(0, seen);
+		if replace_idx < sample_size {
+			reservoir[replace_idx] = candidate;
+		}
+	}
+
+	reservoir
 }
 
 fn prepare_probe(
@@ -485,38 +544,30 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 			}
 
 			if random_probing_enabled {
-				let mut random_candidates = Vec::new();
-				{
+				let requested_count =
+					probe_config.random_nodes_per_interval.try_into().unwrap_or(usize::MAX);
+				let random_recipients = {
 					let graph_read_only = network_graph.read_only();
-					for (node_id, _node_info) in graph_read_only.nodes().unordered_iter() {
-						if *node_id == our_node_id {
-							continue;
-						}
-						if let Ok(pubkey) = node_id.as_pubkey() {
-							random_candidates.push(pubkey);
-						}
-					}
-				}
+					let mut rng = thread_rng();
+					reservoir_sample(
+						graph_read_only.nodes().unordered_iter().filter_map(|(node_id, _node_info)| {
+							if *node_id == our_node_id {
+								return None;
+							}
+							node_id.as_pubkey().ok()
+						}),
+						requested_count,
+						&mut rng,
+					)
+				};
 
-				if random_candidates.is_empty() {
+				if random_recipients.is_empty() {
 					lightning::log_warn!(
 						&*logger,
 						"Random probe skipped: no graph nodes available"
 					);
 					continue;
 				}
-
-				let random_recipients = {
-					let mut rng = thread_rng();
-					rng.shuffle(&mut random_candidates);
-
-					let requested_count =
-						probe_config.random_nodes_per_interval.try_into().unwrap_or(usize::MAX);
-					let random_probe_count =
-						std::cmp::min(requested_count, random_candidates.len());
-
-					random_candidates.into_iter().take(random_probe_count).collect::<Vec<_>>()
-				};
 
 				for recipient in random_recipients {
 					let recipient_hex = hex_utils::hex_str(&recipient.serialize());
