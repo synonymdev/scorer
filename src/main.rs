@@ -90,6 +90,13 @@ enum ProbeOutcome {
 	Failed,
 }
 
+#[derive(Debug)]
+enum ProbeError {
+	NoRoute(&'static str),
+	SendFailed(channelmanager::ProbeSendFailure),
+	InvalidInput(&'static str),
+}
+
 struct ProbeTracker {
 	pending_probes: StdHashMap<PaymentHash, tokio::sync::oneshot::Sender<ProbeOutcome>>,
 }
@@ -315,22 +322,22 @@ fn prepare_probe(
 	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &disk::FilesystemLogger,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
 	pub_key_hex: &str, probe_amount: u64,
-) -> Option<PaymentHash> {
+) -> Result<PaymentHash, ProbeError> {
 	if probe_amount == 0 {
-		return None;
+		return Err(ProbeError::InvalidInput("probe amount must be greater than 0"));
 	}
-	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)?;
-	if let Ok(pk) = bitcoin::secp256k1::PublicKey::from_slice(&pub_key_bytes) {
-		return send_probe(channel_manager, pk, graph, logger, probe_amount, scorer);
-	}
-	None
+	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)
+		.ok_or(ProbeError::InvalidInput("invalid peer pubkey hex"))?;
+	let pk = bitcoin::secp256k1::PublicKey::from_slice(&pub_key_bytes)
+		.map_err(|_| ProbeError::InvalidInput("invalid peer pubkey"))?;
+	send_probe(channel_manager, pk, graph, logger, probe_amount, scorer)
 }
 
 fn send_probe(
 	channel_manager: &ChannelManager, recipient: PublicKey, graph: &NetworkGraph,
 	logger: &disk::FilesystemLogger, amt_msat: u64,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
-) -> Option<PaymentHash> {
+) -> Result<PaymentHash, ProbeError> {
 	let chans = channel_manager.list_usable_channels();
 	let chan_refs = chans.iter().collect::<Vec<_>>();
 	let mut payment_params = PaymentParameters::from_node_id(recipient, 144);
@@ -353,15 +360,14 @@ fn send_probe(
 		&score_params,
 		&[32; 32],
 	);
-	if let Ok(route) = route_res {
-		// We only send one probe per call (max_path_count = 1), so take the first path
-		if let Some(path) = route.paths.into_iter().next() {
-			if let Ok((payment_hash, _)) = channel_manager.send_probe(path) {
-				return Some(payment_hash);
-			}
-		}
-	}
-	None
+	let route = route_res.map_err(ProbeError::NoRoute)?;
+	let path = route
+		.paths
+		.into_iter()
+		.next()
+		.ok_or(ProbeError::NoRoute("route has no paths"))?;
+	let (payment_hash, _) = channel_manager.send_probe(path).map_err(ProbeError::SendFailed)?;
+	Ok(payment_hash)
 }
 
 async fn handle_ldk_events<'a>(
@@ -1514,116 +1520,157 @@ async fn start_ldk() {
 								amount,
 							);
 
-							if let Some(hash) = payment_hash {
-								lightning::log_info!(
-									&*probing_logger,
-									"Probe SENT to {} for {} msat (hash: {})",
-									peer_pubkey,
-									amount,
-									hash
-								);
+							match payment_hash {
+								Ok(hash) => {
+									lightning::log_info!(
+										&*probing_logger,
+										"Probe SENT to {} for {} msat (hash: {})",
+										peer_pubkey,
+										amount,
+										hash
+									);
 
-								// Register the probe and get a receiver for the outcome
-								let rx = probing_tracker.lock().unwrap().register_probe(hash);
+									// Register the probe and get a receiver for the outcome
+									let rx = probing_tracker.lock().unwrap().register_probe(hash);
 
-								// Wait for the probe outcome with timeout
-								let outcome = tokio::time::timeout(probe_timeout, rx).await;
+									// Wait for the probe outcome with timeout
+									let outcome = tokio::time::timeout(probe_timeout, rx).await;
 
-								match outcome {
-									Ok(Ok(ProbeOutcome::Success)) => {
-										lightning::log_info!(
-											&*probing_logger,
-											"Probe SUCCESS to {} for {} msat (hash: {})",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										lightning::log_info!(
-											&*probing_logger,
-											"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										// Probe succeeded, sleep before next amount
-										tokio::time::sleep(probe_delay).await;
-									},
-									Ok(Ok(ProbeOutcome::Failed)) => {
-										lightning::log_warn!(
-											&*probing_logger,
-											"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										lightning::log_warn!(
-											&*probing_logger,
-											"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										tokio::time::sleep(probe_delay).await;
-										break 'amounts;
-									},
-									Ok(Err(_)) => {
-										lightning::log_warn!(
-											&*probing_logger,
-											"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										lightning::log_warn!(
-											&*probing_logger,
-											"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										tokio::time::sleep(probe_delay).await;
-										break 'amounts;
-									},
-									Err(_) => {
-										lightning::log_warn!(
-											&*probing_logger,
-											"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										lightning::log_warn!(
-											&*probing_logger,
-											"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
-											peer_pubkey,
-											amount,
-											hash
-										);
-										// Clean up the pending probe to avoid memory leak
-										probing_tracker
-											.lock()
-											.unwrap()
-											.pending_probes
-											.remove(&hash);
-										tokio::time::sleep(probe_delay).await;
-										break 'amounts;
-									},
-								}
-							} else {
-								lightning::log_warn!(
-									&*probing_logger,
-									"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
-									peer_pubkey,
-									amount
-								);
-								lightning::log_warn!(
-									&*probing_logger,
-									"probe_completed destination_node={} amount_msat={} state=NO_ROUTE",
-									peer_pubkey,
-									amount
-								);
-								tokio::time::sleep(probe_delay).await;
-								break 'amounts;
+									match outcome {
+										Ok(Ok(ProbeOutcome::Success)) => {
+											lightning::log_info!(
+												&*probing_logger,
+												"Probe SUCCESS to {} for {} msat (hash: {})",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_info!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											// Probe succeeded, sleep before next amount
+											tokio::time::sleep(probe_delay).await;
+										},
+										Ok(Ok(ProbeOutcome::Failed)) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_warn!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											tokio::time::sleep(probe_delay).await;
+											break 'amounts;
+										},
+										Ok(Err(_)) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_warn!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											tokio::time::sleep(probe_delay).await;
+											break 'amounts;
+										},
+										Err(_) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_warn!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											// Clean up the pending probe to avoid memory leak
+											probing_tracker
+												.lock()
+												.unwrap()
+												.pending_probes
+												.remove(&hash);
+											tokio::time::sleep(probe_delay).await;
+											break 'amounts;
+										},
+									}
+								},
+								Err(ProbeError::NoRoute(err)) => {
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe NO_ROUTE to {} for {} msat (error: {}), skipping remaining amounts",
+										peer_pubkey,
+										amount,
+										err
+									);
+									lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
+										peer_pubkey,
+										amount,
+										err
+									);
+									tokio::time::sleep(probe_delay).await;
+									break 'amounts;
+								},
+								Err(ProbeError::SendFailed(err)) => {
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe SEND_FAILED to {} for {} msat (error: {:?}), skipping remaining amounts",
+										peer_pubkey,
+										amount,
+										err
+									);
+									lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
+										peer_pubkey,
+										amount,
+										err
+									);
+									tokio::time::sleep(probe_delay).await;
+									break 'amounts;
+								},
+								Err(ProbeError::InvalidInput(err)) => {
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe INVALID_INPUT to {} for {} msat (error: {}), skipping remaining amounts",
+										peer_pubkey,
+										amount,
+										err
+									);
+									lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
+										peer_pubkey,
+										amount,
+										err
+									);
+									tokio::time::sleep(probe_delay).await;
+									break 'amounts;
+								},
 							}
 						}
 
