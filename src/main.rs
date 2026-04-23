@@ -187,14 +187,16 @@ type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<BitcoindClient>,
 	Arc<BitcoindClient>,
 	Arc<FilesystemLogger>,
-	Arc<MonitorUpdatingPersister<
-		Arc<FilesystemStore>,
-		Arc<FilesystemLogger>,
-		Arc<KeysManager>,
-		Arc<KeysManager>,
-		Arc<BitcoindClient>,
-		Arc<BitcoindClient>,
-	>>,
+	Arc<
+		MonitorUpdatingPersister<
+			Arc<FilesystemStore>,
+			Arc<FilesystemLogger>,
+			Arc<KeysManager>,
+			Arc<KeysManager>,
+			Arc<BitcoindClient>,
+			Arc<BitcoindClient>,
+		>,
+	>,
 	Arc<KeysManager>,
 >;
 
@@ -256,14 +258,16 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
 // Needed due to rust-lang/rust#63033.
 struct OutputSweeperWrapper(Arc<OutputSweeper>);
 
-const SCORER_EXPERIMENTAL_PERSISTENCE_KEY: &str = "scorer_experimental";
+const SCORER_PERSISTENCE_FILE_NAME: &str = "scorer";
 
-fn remap_scorer_key<'a>(primary_namespace: &str, secondary_namespace: &str, key: &'a str) -> &'a str {
+fn remap_scorer_key<'a>(
+	primary_namespace: &str, secondary_namespace: &str, key: &'a str,
+) -> &'a str {
 	if primary_namespace == SCORER_PERSISTENCE_PRIMARY_NAMESPACE
 		&& secondary_namespace == SCORER_PERSISTENCE_SECONDARY_NAMESPACE
 		&& key == SCORER_PERSISTENCE_KEY
 	{
-		SCORER_EXPERIMENTAL_PERSISTENCE_KEY
+		SCORER_PERSISTENCE_FILE_NAME
 	} else {
 		key
 	}
@@ -360,11 +364,7 @@ fn send_probe(
 		&[32; 32],
 	);
 	let route = route_res.map_err(ProbeError::NoRoute)?;
-	let path = route
-		.paths
-		.into_iter()
-		.next()
-		.ok_or(ProbeError::NoRoute("route has no paths"))?;
+	let path = route.paths.into_iter().next().ok_or(ProbeError::NoRoute("route has no paths"))?;
 	let (payment_hash, _) = channel_manager.send_probe(path).map_err(ProbeError::SendFailed)?;
 	Ok(payment_hash)
 }
@@ -853,7 +853,7 @@ async fn start_ldk() {
 	let network_graph =
 		Arc::new(disk::read_network(Path::new(&network_graph_path), args.network, logger.clone()));
 
-	let scorer_path = format!("{}/{}", ldk_data_dir.clone(), SCORER_EXPERIMENTAL_PERSISTENCE_KEY);
+	let scorer_path = format!("{}/{}", ldk_data_dir.clone(), SCORER_PERSISTENCE_FILE_NAME);
 	let scorer = Arc::new(RwLock::new(disk::read_scorer(
 		Path::new(&scorer_path),
 		Arc::clone(&network_graph),
