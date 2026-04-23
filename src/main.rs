@@ -339,6 +339,7 @@ fn send_probe(
 	let inflight_scorer = ScorerAccountingForInFlightHtlcs::new(&scorer, &in_flight_htlcs);
 	let score_params = ProbabilisticScoringFeeParameters {
 		base_penalty_msat: 500_000,
+		base_penalty_amount_multiplier_msat: 131_072 * 3,
 		..Default::default()
 	};
 	let route_res = lightning::routing::router::find_route(
@@ -857,6 +858,7 @@ async fn start_ldk() {
 	// Step 10: Create Routers
 	let scoring_fee_params = ProbabilisticScoringFeeParameters {
 		base_penalty_msat: 500_000,
+		base_penalty_amount_multiplier_msat: 131_072 * 3,
 		..Default::default()
 	};
 	let router = Arc::new(DefaultRouter::new(
