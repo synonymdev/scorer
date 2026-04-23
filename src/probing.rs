@@ -206,6 +206,22 @@ mod tests {
 		assert!(tracker.timed_out_probes.len() <= MAX_TIMED_OUT_PROBES);
 		assert!(!tracker.timed_out_probes.contains_key(&PaymentHash([0; 32])));
 	}
+
+	#[test]
+	fn extract_peer_pubkey_from_pubkey_and_addr() {
+		assert_eq!(super::extract_peer_pubkey("02abc123@1.2.3.4:9735"), Some("02abc123"));
+	}
+
+	#[test]
+	fn extract_peer_pubkey_from_raw_pubkey() {
+		assert_eq!(super::extract_peer_pubkey("02abc123"), Some("02abc123"));
+	}
+
+	#[test]
+	fn extract_peer_pubkey_rejects_empty_pubkey() {
+		assert_eq!(super::extract_peer_pubkey("@1.2.3.4:9735"), None);
+		assert_eq!(super::extract_peer_pubkey("   "), None);
+	}
 }
 
 fn truncate_pubkey(pubkey: &str) -> String {
@@ -213,6 +229,15 @@ fn truncate_pubkey(pubkey: &str) -> String {
 		format!("{}...", &pubkey[..12])
 	} else {
 		pubkey.to_string()
+	}
+}
+
+fn extract_peer_pubkey(peer: &str) -> Option<&str> {
+	let pubkey = peer.split('@').next().unwrap_or("").trim();
+	if pubkey.is_empty() {
+		None
+	} else {
+		Some(pubkey)
 	}
 }
 
@@ -367,7 +392,15 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 			if peer_probing_enabled {
 				let peer_count = probe_config.peers.len();
 				for (peer_idx, peer) in probe_config.peers.iter().enumerate() {
-					let peer_short = truncate_pubkey(peer);
+					let Some(peer_pubkey) = extract_peer_pubkey(peer) else {
+						lightning::log_warn!(
+							&*logger,
+							"Probe skipped: invalid peer entry '{}' (expected pubkey@host:port or pubkey)",
+							peer
+						);
+						continue;
+					};
+					let peer_short = truncate_pubkey(peer_pubkey);
 					'amounts: for &amount in &sorted_amounts {
 						let payment_hash = prepare_probe(
 							&channel_manager,
@@ -375,7 +408,7 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							&logger,
 							&scorer,
 							&scoring_fee_params,
-							peer,
+							peer_pubkey,
 							amount,
 						);
 
