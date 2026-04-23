@@ -252,7 +252,9 @@ struct OutputSweeperWrapper(Arc<OutputSweeper>);
 
 const SCORER_EXPERIMENTAL_PERSISTENCE_KEY: &str = "scorer_experimental";
 
-fn remap_scorer_key<'a>(primary_namespace: &str, secondary_namespace: &str, key: &'a str) -> &'a str {
+fn remap_scorer_key<'a>(
+	primary_namespace: &str, secondary_namespace: &str, key: &'a str,
+) -> &'a str {
 	if primary_namespace == SCORER_PERSISTENCE_PRIMARY_NAMESPACE
 		&& secondary_namespace == SCORER_PERSISTENCE_SECONDARY_NAMESPACE
 		&& key == SCORER_PERSISTENCE_KEY
@@ -857,11 +859,7 @@ async fn start_ldk() {
 	)));
 
 	// Step 10: Create Routers
-	let scoring_fee_params = ProbabilisticScoringFeeParameters {
-		base_penalty_msat: 500_000,
-		base_penalty_amount_multiplier_msat: 131_072 * 3,
-		..Default::default()
-	};
+	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
 	let router = Arc::new(DefaultRouter::new(
 		network_graph.clone(),
 		logger.clone(),
