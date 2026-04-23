@@ -421,7 +421,7 @@ async fn start_ldk() {
 		logger.clone(),
 		keys_manager.clone(),
 		scorer.clone(),
-		scoring_fee_params,
+		scoring_fee_params.clone(),
 	));
 
 	let message_router =
@@ -994,6 +994,7 @@ async fn start_ldk() {
 				network_graph: Arc::clone(&network_graph),
 				logger: Arc::clone(&logger),
 				scorer: Arc::clone(&scorer),
+				scoring_fee_params,
 				tracker: Arc::clone(&probe_tracker),
 			},
 		);

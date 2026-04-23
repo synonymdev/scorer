@@ -25,6 +25,7 @@ pub(crate) struct ProbingDeps {
 	pub(crate) network_graph: Arc<NetworkGraph>,
 	pub(crate) logger: Arc<FilesystemLogger>,
 	pub(crate) scorer: Arc<RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<FilesystemLogger>>>>,
+	pub(crate) scoring_fee_params: ProbabilisticScoringFeeParameters,
 	pub(crate) tracker: Arc<Mutex<ProbeTracker>>,
 }
 
@@ -218,6 +219,7 @@ fn truncate_pubkey(pubkey: &str) -> String {
 fn prepare_probe(
 	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &FilesystemLogger,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<FilesystemLogger>>>,
+	scoring_fee_params: &ProbabilisticScoringFeeParameters,
 	pub_key_hex: &str, probe_amount: u64,
 ) -> Option<PaymentHash> {
 	if probe_amount == 0 {
@@ -225,7 +227,15 @@ fn prepare_probe(
 	}
 	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)?;
 	if let Ok(pk) = PublicKey::from_slice(&pub_key_bytes) {
-		return send_probe(channel_manager, pk, graph, logger, probe_amount, scorer);
+		return send_probe(
+			channel_manager,
+			pk,
+			graph,
+			logger,
+			probe_amount,
+			scorer,
+			scoring_fee_params,
+		);
 	}
 	None
 }
@@ -234,6 +244,7 @@ fn send_probe(
 	channel_manager: &ChannelManager, recipient: PublicKey, graph: &NetworkGraph,
 	logger: &FilesystemLogger, amt_msat: u64,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<FilesystemLogger>>>,
+	scoring_fee_params: &ProbabilisticScoringFeeParameters,
 ) -> Option<PaymentHash> {
 	let chans = channel_manager.list_usable_channels();
 	let chan_refs = chans.iter().collect::<Vec<_>>();
@@ -242,7 +253,6 @@ fn send_probe(
 	let in_flight_htlcs = channel_manager.compute_inflight_htlcs();
 	let scorer = scorer.read().unwrap();
 	let inflight_scorer = ScorerAccountingForInFlightHtlcs::new(&scorer, &in_flight_htlcs);
-	let score_params: ProbabilisticScoringFeeParameters = Default::default();
 	let route_res = lightning::routing::router::find_route(
 		&channel_manager.get_our_node_id(),
 		&RouteParameters::from_payment_params_and_value(payment_params, amt_msat),
@@ -250,7 +260,7 @@ fn send_probe(
 		Some(&chan_refs),
 		logger,
 		&inflight_scorer,
-		&score_params,
+		scoring_fee_params,
 		&[32; 32],
 	);
 	if let Ok(route) = route_res {
@@ -340,7 +350,14 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 	);
 
 	tokio::spawn(async move {
-		let ProbingDeps { channel_manager, network_graph, logger, scorer, tracker } = deps;
+		let ProbingDeps {
+			channel_manager,
+			network_graph,
+			logger,
+			scorer,
+			scoring_fee_params,
+			tracker,
+		} = deps;
 		let mut interval = tokio::time::interval(Duration::from_secs(probe_config.interval_sec));
 		let our_node_id = NodeId::from_pubkey(&channel_manager.get_our_node_id());
 
@@ -357,6 +374,7 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							&network_graph,
 							&logger,
 							&scorer,
+							&scoring_fee_params,
 							peer,
 							amount,
 						);
@@ -478,6 +496,7 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 						&logger,
 						amount,
 						&scorer,
+						&scoring_fee_params,
 					);
 
 					if let Some(hash) = payment_hash {
