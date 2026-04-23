@@ -484,8 +484,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 								ProbeWaitResult::Success => {
 									lightning::log_info!(
 										&*logger,
-										"Probe SUCCESS to {} for {} msat (hash: {})",
-										peer_short,
+										"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+										peer_pubkey,
 										amount,
 										hash
 									);
@@ -494,8 +494,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 								ProbeWaitResult::Failed => {
 									lightning::log_warn!(
 										&*logger,
-										"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
-										peer_short,
+										"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
+										peer_pubkey,
 										amount,
 										hash
 									);
@@ -505,8 +505,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 								ProbeWaitResult::Dropped => {
 									lightning::log_warn!(
 										&*logger,
-										"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
-										peer_short,
+										"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+										peer_pubkey,
 										amount,
 										hash
 									);
@@ -516,8 +516,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 								ProbeWaitResult::Timeout => {
 									lightning::log_warn!(
 										&*logger,
-										"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
-										peer_short,
+										"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+										peer_pubkey,
 										amount,
 										hash
 									);
@@ -528,8 +528,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 						} else {
 							lightning::log_warn!(
 								&*logger,
-								"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
-								peer_short,
+								"probe_completed destination_node={} amount_msat={} state=NO_ROUTE",
+								peer_pubkey,
 								amount
 							);
 							tokio::time::sleep(probe_delay).await;
@@ -596,8 +596,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							ProbeWaitResult::Success => {
 								lightning::log_info!(
 									&*logger,
-									"Random probe SUCCESS to {} for {} msat (hash: {})",
-									peer_short,
+									"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+									recipient_hex,
 									amount,
 									hash
 								);
@@ -606,8 +606,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							ProbeWaitResult::Failed => {
 								lightning::log_warn!(
 									&*logger,
-									"Random probe FAILED to {} for {} msat (hash: {})",
-									peer_short,
+									"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
+									recipient_hex,
 									amount,
 									hash
 								);
@@ -616,8 +616,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							ProbeWaitResult::Dropped => {
 								lightning::log_warn!(
 									&*logger,
-									"Random probe DROPPED to {} for {} msat (hash: {}), channel closed",
-									peer_short,
+									"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+									recipient_hex,
 									amount,
 									hash
 								);
@@ -626,8 +626,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							ProbeWaitResult::Timeout => {
 								lightning::log_warn!(
 									&*logger,
-									"Random probe TIMEOUT to {} for {} msat (hash: {})",
-									peer_short,
+									"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+									recipient_hex,
 									amount,
 									hash
 								);
@@ -637,8 +637,8 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 					} else {
 						lightning::log_warn!(
 							&*logger,
-							"Random probe NO_ROUTE to {} for {} msat",
-							peer_short,
+							"probe_completed destination_node={} amount_msat={} state=NO_ROUTE",
+							recipient_hex,
 							amount
 						);
 						tokio::time::sleep(probe_delay).await;
