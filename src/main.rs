@@ -50,7 +50,7 @@ use lightning::util::hash_tables::hash_map::Entry;
 use lightning::util::hash_tables::HashMap;
 use lightning::util::logger::Logger;
 use lightning::util::persist::{
-	self, KVStore, MonitorUpdatingPersisterAsync, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	self, KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
 	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -187,15 +187,14 @@ type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<BitcoindClient>,
 	Arc<BitcoindClient>,
 	Arc<FilesystemLogger>,
-	chainmonitor::AsyncPersister<
+	Arc<MonitorUpdatingPersister<
 		Arc<FilesystemStore>,
-		TokioSpawner,
 		Arc<FilesystemLogger>,
 		Arc<KeysManager>,
 		Arc<KeysManager>,
 		Arc<BitcoindClient>,
 		Arc<BitcoindClient>,
-	>,
+	>>,
 	Arc<KeysManager>,
 >;
 
@@ -814,33 +813,32 @@ async fn start_ldk() {
 	// Step 5: Initialize Persistence
 	let fs_store = Arc::new(FilesystemStore::new(ldk_data_dir.clone().into()));
 	let scorer_store = Arc::new(ScorerKeyRemappingStore::new(Arc::clone(&fs_store)));
-	let persister = MonitorUpdatingPersisterAsync::new(
+	let persister = Arc::new(MonitorUpdatingPersister::new(
 		Arc::clone(&fs_store),
-		TokioSpawner,
 		Arc::clone(&logger),
 		1000,
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&bitcoind_client),
 		Arc::clone(&bitcoind_client),
-	);
+	));
 	// Alternatively, you can use the `FilesystemStore` as a `Persist` directly, at the cost of
 	// larger `ChannelMonitor` update writes (but no deletion or cleanup):
 	//let persister = Arc::clone(&fs_store);
 
 	// Step 6: Read ChannelMonitor state from disk
-	let mut channelmonitors = persister.read_all_channel_monitors_with_updates().await.unwrap();
+	let mut channelmonitors = persister.read_all_channel_monitors_with_updates().unwrap();
 	// If you are using the `FilesystemStore` as a `Persist` directly, use
 	// `lightning::util::persist::read_channel_monitors` like this:
 	// read_channel_monitors(Arc::clone(&persister), Arc::clone(&keys_manager), Arc::clone(&keys_manager)).unwrap();
 
 	// Step 7: Initialize the ChainMonitor
-	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new_async_beta(
+	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new(
 		None,
 		Arc::clone(&broadcaster),
 		Arc::clone(&logger),
 		Arc::clone(&fee_estimator),
-		persister,
+		Arc::clone(&persister),
 		Arc::clone(&keys_manager),
 		keys_manager.get_peer_storage_key(),
 	));
