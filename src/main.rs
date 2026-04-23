@@ -44,6 +44,7 @@ use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::sign::{EntropySource, InMemorySigner, KeysManager, NodeSigner};
 use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::util::async_poll::AsyncResult;
 use lightning::util::config::UserConfig;
 use lightning::util::hash_tables::hash_map::Entry;
 use lightning::util::hash_tables::HashMap;
@@ -51,6 +52,8 @@ use lightning::util::logger::Logger;
 use lightning::util::persist::{
 	self, KVStore, MonitorUpdatingPersisterAsync, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 use lightning::util::sweep as ldk_sweep;
@@ -239,13 +242,65 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
 	Arc<BitcoindClient>,
 	Arc<BitcoindClient>,
 	Arc<dyn Filter + Send + Sync>,
-	Arc<FilesystemStore>,
+	Arc<ScorerKeyRemappingStore>,
 	Arc<FilesystemLogger>,
 	Arc<KeysManager>,
 >;
 
 // Needed due to rust-lang/rust#63033.
 struct OutputSweeperWrapper(Arc<OutputSweeper>);
+
+const SCORER_EXPERIMENTAL_PERSISTENCE_KEY: &str = "scorer_experimental";
+
+fn remap_scorer_key<'a>(primary_namespace: &str, secondary_namespace: &str, key: &'a str) -> &'a str {
+	if primary_namespace == SCORER_PERSISTENCE_PRIMARY_NAMESPACE
+		&& secondary_namespace == SCORER_PERSISTENCE_SECONDARY_NAMESPACE
+		&& key == SCORER_PERSISTENCE_KEY
+	{
+		SCORER_EXPERIMENTAL_PERSISTENCE_KEY
+	} else {
+		key
+	}
+}
+
+struct ScorerKeyRemappingStore {
+	inner: Arc<FilesystemStore>,
+}
+
+impl ScorerKeyRemappingStore {
+	fn new(inner: Arc<FilesystemStore>) -> Self {
+		Self { inner }
+	}
+}
+
+impl KVStore for ScorerKeyRemappingStore {
+	fn read(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> AsyncResult<'static, Vec<u8>, io::Error> {
+		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
+		self.inner.read(primary_namespace, secondary_namespace, key)
+	}
+
+	fn write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+	) -> AsyncResult<'static, (), io::Error> {
+		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
+		self.inner.write(primary_namespace, secondary_namespace, key, buf)
+	}
+
+	fn remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+	) -> AsyncResult<'static, (), io::Error> {
+		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
+		self.inner.remove(primary_namespace, secondary_namespace, key, lazy)
+	}
+
+	fn list(
+		&self, primary_namespace: &str, secondary_namespace: &str,
+	) -> AsyncResult<'static, Vec<String>, io::Error> {
+		self.inner.list(primary_namespace, secondary_namespace)
+	}
+}
 
 fn truncate_pubkey(pubkey: &str) -> String {
 	if pubkey.len() > 12 {
@@ -750,6 +805,7 @@ async fn start_ldk() {
 
 	// Step 5: Initialize Persistence
 	let fs_store = Arc::new(FilesystemStore::new(ldk_data_dir.clone().into()));
+	let scorer_store = Arc::new(ScorerKeyRemappingStore::new(Arc::clone(&fs_store)));
 	let persister = MonitorUpdatingPersisterAsync::new(
 		Arc::clone(&fs_store),
 		TokioSpawner,
@@ -791,7 +847,7 @@ async fn start_ldk() {
 	let network_graph =
 		Arc::new(disk::read_network(Path::new(&network_graph_path), args.network, logger.clone()));
 
-	let scorer_path = format!("{}/scorer", ldk_data_dir.clone());
+	let scorer_path = format!("{}/{}", ldk_data_dir.clone(), SCORER_EXPERIMENTAL_PERSISTENCE_KEY);
 	let scorer = Arc::new(RwLock::new(disk::read_scorer(
 		Path::new(&scorer_path),
 		Arc::clone(&network_graph),
@@ -883,7 +939,7 @@ async fn start_ldk() {
 				None,
 				keys_manager.clone(),
 				bitcoind_client.clone(),
-				fs_store.clone(),
+				scorer_store.clone(),
 				logger.clone(),
 			);
 			(channel_manager.current_best_block(), sweeper)
@@ -895,7 +951,7 @@ async fn start_ldk() {
 				None,
 				keys_manager.clone(),
 				bitcoind_client.clone(),
-				fs_store.clone(),
+				scorer_store.clone(),
 				logger.clone(),
 			);
 			let mut reader = io::Cursor::new(&mut bytes);
@@ -1198,7 +1254,7 @@ async fn start_ldk() {
 	// Step 21: Background Processing
 	let (bp_exit, bp_exit_check) = tokio::sync::watch::channel(());
 	let mut background_processor = tokio::spawn(process_events_async(
-		Arc::clone(&fs_store),
+		Arc::clone(&scorer_store),
 		event_handler,
 		Arc::clone(&chain_monitor),
 		Arc::clone(&channel_manager),
