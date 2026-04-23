@@ -1275,11 +1275,13 @@ async fn start_ldk() {
 			match dns_bootstrap::DnsBootstrapper::new(dns_config) {
 				Ok(bootstrapper) => {
 					let bootstrap_pm = Arc::clone(&peer_manager);
+					let bootstrap_logger = Arc::clone(&logger);
 					let stop_bootstrap = Arc::clone(&stop_listen_connect);
 					let interval_secs = bootstrapper.interval_secs();
 					let num_peers = bootstrapper.num_peers();
 
-					println!(
+					lightning::log_info!(
+						&*logger,
 						"DNS bootstrap enabled: {} seeds, target {} peers, interval {}s",
 						bootstrapper.config().seeds.len(),
 						num_peers,
@@ -1312,9 +1314,16 @@ async fn start_ldk() {
 								})
 								.collect();
 
-							match bootstrapper.sample_node_addrs(num_peers, &ignore).await {
+							match bootstrapper
+								.sample_node_addrs(num_peers, &ignore, &*bootstrap_logger)
+								.await
+							{
 								Ok(peers) => {
-									println!("[dns_bootstrap] Discovered {} peers", peers.len());
+									lightning::log_info!(
+										&*bootstrap_logger,
+										"[dns_bootstrap] Discovered {} peers",
+										peers.len()
+									);
 									for peer in peers {
 										let _ = cli::do_connect_peer(
 											peer.pubkey,
@@ -1325,14 +1334,22 @@ async fn start_ldk() {
 									}
 								},
 								Err(e) => {
-									eprintln!("[dns_bootstrap] Bootstrap failed: {}", e);
+									lightning::log_warn!(
+										&*bootstrap_logger,
+										"[dns_bootstrap] Bootstrap failed: {}",
+										e
+									);
 								},
 							}
 						}
 					});
 				},
 				Err(e) => {
-					eprintln!("[dns_bootstrap] Failed to initialize bootstrapper: {}", e);
+					lightning::log_error!(
+						&*logger,
+						"[dns_bootstrap] Failed to initialize bootstrapper: {}",
+						e
+					);
 				},
 			}
 		}
