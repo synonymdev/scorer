@@ -1,17 +1,22 @@
-use crate::cli::LdkUserInfo;
 use crate::dns_bootstrap::DnsBootstrapConfig;
+use crate::runtime_config::{LdkUserInfo, ProbingConfig};
 use bitcoin::network::Network;
 use lightning::ln::msgs::SocketAddress;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ConfigError {
+	#[error("config file not found at {0}")]
 	FileNotFound(String),
+	#[error("deprecated config.json detected at {0}; use config.toml instead")]
 	DeprecatedJsonConfig(String),
+	#[error("config parse error: {0}")]
 	ParseError(String),
+	#[error("config validation failed: {0}")]
 	ValidationError(String),
 }
 
@@ -25,7 +30,7 @@ pub struct NodeConfig {
 	pub ldk: LdkConfig,
 	#[serde(default)]
 	pub rapid_gossip_sync: RapidGossipSyncConfig,
-	pub probing: Option<ProbingConfig>,
+	pub probing: Option<RawProbingConfig>,
 	pub dns_bootstrap: Option<DnsBootstrapConfig>,
 }
 
@@ -60,7 +65,7 @@ pub struct RapidGossipSyncConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProbingConfig {
+pub struct RawProbingConfig {
 	pub interval_sec: u64,
 	pub peers: Vec<String>,
 	pub amount_msats: Vec<u64>,
@@ -168,6 +173,52 @@ impl NodeConfig {
 			}
 		}
 
+		if self.rapid_gossip_sync.enabled && self.rapid_gossip_sync.interval_hours == 0 {
+			return Err(ConfigError::ValidationError(
+				"rapid_gossip_sync.interval_hours must be greater than 0 when enabled".to_string(),
+			));
+		}
+
+		if let Some(probing) = &self.probing {
+			if probing.interval_sec == 0 {
+				return Err(ConfigError::ValidationError(
+					"probing.interval_sec must be greater than 0".to_string(),
+				));
+			}
+			if probing.timeout_sec == 0 {
+				return Err(ConfigError::ValidationError(
+					"probing.timeout_sec must be greater than 0".to_string(),
+				));
+			}
+		}
+
+		if let Some(dns_bootstrap) = &self.dns_bootstrap {
+			if dns_bootstrap.enabled {
+				if dns_bootstrap.seeds.is_empty() {
+					return Err(ConfigError::ValidationError(
+						"dns_bootstrap.seeds must not be empty when enabled".to_string(),
+					));
+				}
+				if dns_bootstrap.timeout_secs == 0 {
+					return Err(ConfigError::ValidationError(
+						"dns_bootstrap.timeout_secs must be greater than 0 when enabled"
+							.to_string(),
+					));
+				}
+				if dns_bootstrap.interval_secs == 0 {
+					return Err(ConfigError::ValidationError(
+						"dns_bootstrap.interval_secs must be greater than 0 when enabled"
+							.to_string(),
+					));
+				}
+				if dns_bootstrap.num_peers == 0 {
+					return Err(ConfigError::ValidationError(
+						"dns_bootstrap.num_peers must be greater than 0 when enabled".to_string(),
+					));
+				}
+			}
+		}
+
 		Ok(())
 	}
 
@@ -203,7 +254,7 @@ impl NodeConfig {
 		let announced_listen_addr = self.get_announced_listen_addr();
 		let announced_node_name = self.get_announced_node_name();
 		let network = self.get_network();
-		let probing = self.probing.map(|p| crate::cli::ProbingConfig {
+		let probing = self.probing.map(|p| ProbingConfig {
 			interval_sec: p.interval_sec,
 			peers: p.peers,
 			amount_msats: p.amount_msats,
@@ -349,6 +400,69 @@ rpc_password = "pass"
 				assert!(path.ends_with("config.toml"));
 			},
 			other => panic!("expected FileNotFound, got {:?}", other),
+		}
+	}
+
+	#[test]
+	fn load_fails_when_rapid_sync_interval_is_zero() {
+		let tmp = TempDir::new().expect("failed to create temp dir");
+		let config_path = tmp.path().join("config.toml");
+		write_file(
+			&config_path,
+			r#"[bitcoind]
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+rpc_username = "user"
+rpc_password = "pass"
+
+[rapid_gossip_sync]
+enabled = true
+interval_hours = 0
+"#,
+		);
+
+		let err = match NodeConfig::load(tmp.path().to_str().unwrap()) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => e,
+		};
+		match err {
+			ConfigError::ValidationError(msg) => {
+				assert!(msg.contains("interval_hours"));
+			},
+			other => panic!("expected ValidationError, got {:?}", other),
+		}
+	}
+
+	#[test]
+	fn load_fails_when_dns_bootstrap_enabled_with_zero_interval() {
+		let tmp = TempDir::new().expect("failed to create temp dir");
+		let config_path = tmp.path().join("config.toml");
+		write_file(
+			&config_path,
+			r#"[bitcoind]
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+rpc_username = "user"
+rpc_password = "pass"
+
+[dns_bootstrap]
+enabled = true
+seeds = ["nodes.lightning.wiki"]
+timeout_secs = 30
+num_peers = 10
+interval_secs = 0
+"#,
+		);
+
+		let err = match NodeConfig::load(tmp.path().to_str().unwrap()) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => e,
+		};
+		match err {
+			ConfigError::ValidationError(msg) => {
+				assert!(msg.contains("dns_bootstrap.interval_secs"));
+			},
+			other => panic!("expected ValidationError, got {:?}", other),
 		}
 	}
 }

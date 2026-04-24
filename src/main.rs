@@ -11,13 +11,20 @@ mod events;
 mod hex_utils;
 mod probing;
 mod rapid_sync;
+mod runtime_config;
+mod state;
 mod sweep;
+
+pub(crate) use state::{
+	HTLCStatus, InboundPaymentInfoStorage, MillisatAmount, OutboundPaymentInfoStorage, PaymentInfo,
+};
 
 use crate::bitcoind_client::BitcoindClient;
 use crate::disk::FilesystemLogger;
 use bitcoin::io;
 use bitcoin::BlockHash;
 use disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
+use lightning::chain;
 use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
 use lightning::chain::{BestBlock, Filter};
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
@@ -26,7 +33,6 @@ use lightning::ln::channelmanager::{self, RecentPaymentDetails};
 use lightning::ln::channelmanager::{
 	ChainParameters, ChannelManagerReadArgs, PaymentId, SimpleArcChannelManager,
 };
-use lightning::ln::msgs::DecodeError;
 use lightning::ln::peer_handler::{
 	IgnoringMessageHandler, MessageHandler, PeerManager as LdkPeerManager,
 };
@@ -38,10 +44,8 @@ use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::sign::{InMemorySigner, KeysManager, NodeSigner};
-use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::util::async_poll::AsyncResult;
 use lightning::util::config::UserConfig;
-use lightning::util::hash_tables::HashMap;
 use lightning::util::logger::Logger;
 use lightning::util::persist::{
 	self, KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
@@ -49,9 +53,8 @@ use lightning::util::persist::{
 	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning::util::ser::{ReadableArgs, Writeable};
 use lightning::util::sweep as ldk_sweep;
-use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_background_processor::{process_events_async, GossipSync, NO_LIQUIDITY_MANAGER};
 use lightning_block_sync::gossip::TokioSpawner;
 use lightning_block_sync::{init, poll, BlockSourceErrorKind, SpvClient, UnboundedCache};
@@ -60,7 +63,6 @@ use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::{thread_rng, Rng};
 use std::convert::TryInto;
-use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::io::BufReader;
@@ -69,73 +71,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
-
-#[derive(Copy, Clone)]
-pub(crate) enum HTLCStatus {
-	Pending,
-	Succeeded,
-	Failed,
-}
-
-impl_writeable_tlv_based_enum!(HTLCStatus,
-	(0, Pending) => {},
-	(1, Succeeded) => {},
-	(2, Failed) => {},
-);
-
-pub(crate) struct MillisatAmount(Option<u64>);
-
-impl fmt::Display for MillisatAmount {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		match self.0 {
-			Some(amt) => write!(f, "{}", amt),
-			None => write!(f, "unknown"),
-		}
-	}
-}
-
-impl Readable for MillisatAmount {
-	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
-		let amt: Option<u64> = Readable::read(r)?;
-		Ok(MillisatAmount(amt))
-	}
-}
-
-impl Writeable for MillisatAmount {
-	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-		self.0.write(w)
-	}
-}
-
-pub(crate) struct PaymentInfo {
-	preimage: Option<PaymentPreimage>,
-	secret: Option<PaymentSecret>,
-	status: HTLCStatus,
-	amt_msat: MillisatAmount,
-}
-
-impl_writeable_tlv_based!(PaymentInfo, {
-	(0, preimage, required),
-	(2, secret, required),
-	(4, status, required),
-	(6, amt_msat, required),
-});
-
-pub(crate) struct InboundPaymentInfoStorage {
-	payments: HashMap<PaymentHash, PaymentInfo>,
-}
-
-impl_writeable_tlv_based!(InboundPaymentInfoStorage, {
-	(0, payments, required),
-});
-
-pub(crate) struct OutboundPaymentInfoStorage {
-	payments: HashMap<PaymentId, PaymentInfo>,
-}
-
-impl_writeable_tlv_based!(OutboundPaymentInfoStorage, {
-	(0, payments, required),
-});
 
 type ChainMonitor = chainmonitor::ChainMonitor<
 	InMemorySigner,
@@ -267,12 +202,41 @@ impl KVStore for ScorerKeyRemappingStore {
 async fn start_ldk() {
 	let args = match args::parse_startup_args() {
 		Ok(user_args) => user_args,
-		Err(()) => return,
+		Err(args::StartupArgsError::MissingStorageDirectory) => {
+			let argv0 = std::env::args().next().unwrap_or_else(|| "ldk-sample".to_string());
+			println!("Usage: {} <ldk_storage_directory_path>", argv0);
+			println!();
+			println!(
+				"The config.toml file should be located at <ldk_storage_directory_path>/.ldk/config.toml",
+			);
+			crate::config::print_config_help();
+			return;
+		},
+		Err(args::StartupArgsError::Config(config_err)) => {
+			println!("ERROR: {}", config_err);
+			if matches!(
+				config_err,
+				config::ConfigError::FileNotFound(_)
+					| config::ConfigError::DeprecatedJsonConfig(_)
+					| config::ConfigError::ParseError(_)
+			) {
+				println!();
+				crate::config::print_config_help();
+			}
+			return;
+		},
+		Err(e) => {
+			println!("ERROR: {}", e);
+			return;
+		},
 	};
 
 	// Initialize the LDK data directory if necessary.
 	let ldk_data_dir = format!("{}/.ldk", args.ldk_storage_dir_path);
-	fs::create_dir_all(ldk_data_dir.clone()).unwrap();
+	if let Err(e) = fs::create_dir_all(ldk_data_dir.clone()) {
+		println!("ERROR: Failed to create LDK data directory {}: {}", ldk_data_dir, e);
+		return;
+	}
 
 	// ## Setup
 	// Step 1: Initialize the Logger
@@ -331,7 +295,14 @@ async fn start_ldk() {
 	// other secret key material.
 	let keys_seed_path = format!("{}/keys_seed", ldk_data_dir.clone());
 	let keys_seed = if let Ok(seed) = fs::read(keys_seed_path.clone()) {
-		assert_eq!(seed.len(), 32);
+		if seed.len() != 32 {
+			println!(
+				"ERROR: Invalid keys seed length in {}. Expected 32 bytes, found {}.",
+				keys_seed_path,
+				seed.len()
+			);
+			return;
+		}
 		let mut key = [0; 32];
 		key.copy_from_slice(&seed);
 		key
@@ -340,9 +311,14 @@ async fn start_ldk() {
 		thread_rng().fill_bytes(&mut key);
 		match File::create(keys_seed_path.clone()) {
 			Ok(mut f) => {
-				std::io::Write::write_all(&mut f, &key)
-					.expect("Failed to write node keys seed to disk");
-				f.sync_all().expect("Failed to sync node keys seed to disk");
+				if let Err(e) = std::io::Write::write_all(&mut f, &key) {
+					println!("ERROR: Failed to write node keys seed to disk: {}", e);
+					return;
+				}
+				if let Err(e) = f.sync_all() {
+					println!("ERROR: Failed to sync node keys seed to disk: {}", e);
+					return;
+				}
 			},
 			Err(e) => {
 				println!("ERROR: Unable to create keys seed file {}: {}", keys_seed_path, e);
@@ -351,7 +327,13 @@ async fn start_ldk() {
 		}
 		key
 	};
-	let cur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+	let cur = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+		Ok(d) => d,
+		Err(e) => {
+			println!("ERROR: System clock appears to be before UNIX_EPOCH: {}", e);
+			return;
+		},
+	};
 	let keys_manager =
 		Arc::new(KeysManager::new(&keys_seed, cur.as_secs(), cur.subsec_nanos(), true));
 
@@ -379,7 +361,13 @@ async fn start_ldk() {
 	//let persister = Arc::clone(&fs_store);
 
 	// Step 6: Read ChannelMonitor state from disk
-	let mut channelmonitors = persister.read_all_channel_monitors_with_updates().unwrap();
+	let mut channelmonitors = match persister.read_all_channel_monitors_with_updates() {
+		Ok(monitors) => monitors,
+		Err(e) => {
+			println!("ERROR: Failed to read channel monitors from disk: {}", e);
+			return;
+		},
+	};
 	// If you are using the `FilesystemStore` as a `Persist` directly, use
 	// `lightning::util::persist::read_channel_monitors` like this:
 	// read_channel_monitors(Arc::clone(&persister), Arc::clone(&keys_manager), Arc::clone(&keys_manager)).unwrap();
@@ -396,9 +384,13 @@ async fn start_ldk() {
 	));
 
 	// Step 8: Poll for the best chain tip, which may be used by the channel manager & spv client
-	let polled_chain_tip = init::validate_best_block_header(bitcoind_client.as_ref())
-		.await
-		.expect("Failed to fetch best block header and best block");
+	let polled_chain_tip = match init::validate_best_block_header(bitcoind_client.as_ref()).await {
+		Ok(tip) => tip,
+		Err(e) => {
+			println!("ERROR: Failed to fetch best block header and best block: {:?}", e);
+			return;
+		},
+	};
 
 	// Step 9: Initialize routing ProbabilisticScorer
 	let network_graph_path = format!("{}/network_graph", ldk_data_dir.clone());
@@ -454,7 +446,13 @@ async fn start_ldk() {
 				user_config,
 				channel_monitor_references,
 			);
-			<(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args).unwrap()
+			match <(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args) {
+				Ok(v) => v,
+				Err(e) => {
+					println!("ERROR: Failed to deserialize channel manager: {:?}", e);
+					return;
+				},
+			}
 		} else {
 			// We're starting a fresh node.
 			restarting_node = false;
@@ -514,10 +512,18 @@ async fn start_ldk() {
 				logger.clone(),
 			);
 			let mut reader = io::Cursor::new(&mut bytes);
-			<(BestBlock, OutputSweeper)>::read(&mut reader, read_args)
-				.expect("Failed to deserialize OutputSweeper")
+			match <(BestBlock, OutputSweeper)>::read(&mut reader, read_args) {
+				Ok(v) => v,
+				Err(e) => {
+					println!("ERROR: Failed to deserialize OutputSweeper: {:?}", e);
+					return;
+				},
+			}
 		},
-		Err(e) => panic!("Failed to read OutputSweeper with {}", e),
+		Err(e) => {
+			println!("ERROR: Failed to read OutputSweeper: {}", e);
+			return;
+		},
 	};
 
 	// Step 13: Sync ChannelMonitors, ChannelManager and OutputSweeper to chain tip
@@ -545,14 +551,20 @@ async fn start_ldk() {
 			));
 		}
 
-		init::synchronize_listeners(
+		match init::synchronize_listeners(
 			bitcoind_client.as_ref(),
 			args.network,
 			&mut cache,
 			chain_listeners,
 		)
 		.await
-		.unwrap()
+		{
+			Ok(tip) => tip,
+			Err(e) => {
+				println!("ERROR: Failed to synchronize chain listeners: {:?}", e);
+				return;
+			},
+		}
 	} else {
 		polled_chain_tip
 	};
@@ -562,10 +574,12 @@ async fn start_ldk() {
 		let channel_id = channel_monitor.channel_id();
 		// Note that this may not return `Completed` for ChannelMonitors which were last written by
 		// a version of LDK prior to 0.1.
-		assert_eq!(
-			chain_monitor.load_existing_monitor(channel_id, channel_monitor),
-			Ok(ChannelMonitorUpdateStatus::Completed)
-		);
+		if chain_monitor.load_existing_monitor(channel_id, channel_monitor)
+			!= Ok(ChannelMonitorUpdateStatus::Completed)
+		{
+			println!("ERROR: Failed to load existing monitor for channel {}", channel_id);
+			return;
+		}
 	}
 
 	// Step 15: Initialize RapidGossipSync if enabled
@@ -613,7 +627,19 @@ async fn start_ldk() {
 	// messages. Doing this only makes sense for a always-online public routing node, and doesn't
 	// provide you any direct value, but its nice to offer the service for others.
 	let channel_manager: Arc<ChannelManager> = Arc::new(channel_manager);
-	let resolver = "8.8.8.8:53".to_socket_addrs().unwrap().next().unwrap();
+	let resolver = match "8.8.8.8:53".to_socket_addrs() {
+		Ok(mut addrs) => match addrs.next() {
+			Some(addr) => addr,
+			None => {
+				println!("ERROR: Resolver address lookup returned no addresses");
+				return;
+			},
+		},
+		Err(e) => {
+			println!("ERROR: Failed to resolve default DNS resolver: {}", e);
+			return;
+		},
+	};
 	let domain_resolver =
 		Arc::new(OMDomainResolver::new(resolver, Some(Arc::clone(&channel_manager))));
 
@@ -630,7 +656,13 @@ async fn start_ldk() {
 		IgnoringMessageHandler {},
 	));
 	let mut ephemeral_bytes = [0; 32];
-	let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+	let current_time = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+		Ok(d) => d.as_secs(),
+		Err(e) => {
+			println!("ERROR: System clock appears to be before UNIX_EPOCH: {}", e);
+			return;
+		},
+	};
 	rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
 	let lightning_msg_handler = MessageHandler {
 		chan_handler: Arc::clone(&channel_manager),
@@ -641,7 +673,13 @@ async fn start_ldk() {
 	};
 	let peer_manager: Arc<PeerManager> = Arc::new(PeerManager::new(
 		lightning_msg_handler,
-		current_time.try_into().unwrap(),
+		match current_time.try_into() {
+			Ok(ts) => ts,
+			Err(_) => {
+				println!("ERROR: Current timestamp does not fit expected peer-manager type");
+				return;
+			},
+		},
 		&ephemeral_bytes,
 		logger.clone(),
 		Arc::clone(&keys_manager),
@@ -664,9 +702,18 @@ async fn start_ldk() {
 	let stop_listen_connect = Arc::new(AtomicBool::new(false));
 	let stop_listen = Arc::clone(&stop_listen_connect);
 	tokio::spawn(async move {
-		let listener = tokio::net::TcpListener::bind(format!("[::]:{}", listening_port))
-			.await
-			.expect("Failed to bind to listen port - is something else already listening on it?");
+		let listener = match tokio::net::TcpListener::bind(format!("[::]:{}", listening_port)).await
+		{
+			Ok(listener) => listener,
+			Err(e) => {
+				eprintln!(
+					"Failed to bind to listen port {} - is something else already listening on it? {}",
+					listening_port,
+					e
+				);
+				return;
+			},
+		};
 		loop {
 			let peer_mgr = peer_manager_connection_handler.clone();
 			let (tcp_stream, _) = match listener.accept().await {
@@ -680,11 +727,14 @@ async fn start_ldk() {
 				return;
 			}
 			tokio::spawn(async move {
-				lightning_net_tokio::setup_inbound(
-					peer_mgr.clone(),
-					tcp_stream.into_std().unwrap(),
-				)
-				.await;
+				match tcp_stream.into_std() {
+					Ok(std_stream) => {
+						lightning_net_tokio::setup_inbound(peer_mgr.clone(), std_stream).await;
+					},
+					Err(e) => {
+						eprintln!("Failed to convert inbound TCP stream: {}", e);
+					},
+				}
 			});
 		}
 	});
@@ -748,19 +798,38 @@ async fn start_ldk() {
 			RecentPaymentDetails::AwaitingInvoice { payment_id } => payment_id,
 		})
 		.collect::<Vec<PaymentId>>();
-	for (payment_id, payment_info) in outbound_payments
-		.lock()
-		.unwrap()
-		.payments
-		.iter_mut()
-		.filter(|(_, i)| matches!(i.status, HTLCStatus::Pending))
 	{
-		if !recent_payments_payment_ids.contains(payment_id) {
-			payment_info.status = HTLCStatus::Failed;
+		let mut outbound_payments_lock = match outbound_payments.lock() {
+			Ok(lock) => lock,
+			Err(_) => {
+				println!("ERROR: Outbound payments lock poisoned");
+				return;
+			},
+		};
+		for (payment_id, payment_info) in outbound_payments_lock
+			.payments
+			.iter_mut()
+			.filter(|(_, i)| matches!(i.status, HTLCStatus::Pending))
+		{
+			if !recent_payments_payment_ids.contains(payment_id) {
+				payment_info.status = HTLCStatus::Failed;
+			}
 		}
 	}
-	let outbound_payments_bytes = { outbound_payments.lock().unwrap().encode() };
-	fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments_bytes).await.unwrap();
+	let outbound_payments_bytes = {
+		let outbound_payments_lock = match outbound_payments.lock() {
+			Ok(lock) => lock,
+			Err(_) => {
+				println!("ERROR: Outbound payments lock poisoned");
+				return;
+			},
+		};
+		outbound_payments_lock.encode()
+	};
+	if let Err(e) = fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments_bytes).await {
+		println!("ERROR: Failed to persist outbound payments: {}", e);
+		return;
+	}
 
 	// Step 20: Handle LDK Events
 	let probe_tracker = Arc::new(Mutex::new(probing::ProbeTracker::new()));
@@ -810,7 +879,7 @@ async fn start_ldk() {
 			})
 		},
 		false,
-		|| Some(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap()),
+		|| SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok(),
 	));
 
 	// Regularly reconnect to channel peers.
@@ -848,11 +917,11 @@ async fn start_ldk() {
 					Vec::new()
 				};
 				for addr in addrs {
-					let sockaddrs = addr.to_socket_addrs();
-					if sockaddrs.is_err() {
-						continue;
-					}
-					for sockaddr in sockaddrs.unwrap() {
+					let sockaddrs = match addr.to_socket_addrs() {
+						Ok(addrs) => addrs,
+						Err(_) => continue,
+					};
+					for sockaddr in sockaddrs {
 						let _ =
 							cli::do_connect_peer(node_id, sockaddr, Arc::clone(&connect_pm)).await;
 					}
@@ -1075,7 +1144,7 @@ async fn start_ldk() {
 	peer_manager.disconnect_all_peers();
 
 	if let Err(e) = bg_res {
-		fs_store
+		if let Err(write_err) = fs_store
 			.write(
 				persist::CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 				persist::CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -1083,20 +1152,33 @@ async fn start_ldk() {
 				channel_manager.encode(),
 			)
 			.await
-			.unwrap();
-		use lightning::util::logger::Logger;
-		lightning::log_error!(&*logger, "Last-ditch ChannelManager persistence completed");
-		panic!(
-			"ERR: background processing stopped with result {:?}, exiting.\n\
-			Last-ditch ChannelManager persistence completed",
-			e
-		);
+		{
+			lightning::log_error!(
+				&*logger,
+				"Last-ditch ChannelManager persistence failed: {}",
+				write_err
+			);
+		} else {
+			lightning::log_error!(&*logger, "Last-ditch ChannelManager persistence completed");
+		}
+		lightning::log_error!(&*logger, "ERR: background processing stopped: {:?}", e);
+		return;
 	}
 
 	// Stop the background processor.
 	if !bp_exit.is_closed() {
-		bp_exit.send(()).unwrap();
-		background_processor.await.unwrap().unwrap();
+		if let Err(e) = bp_exit.send(()) {
+			lightning::log_warn!(&*logger, "Failed to signal background processor shutdown: {}", e);
+		}
+		match background_processor.await {
+			Ok(Ok(())) => {},
+			Ok(Err(e)) => {
+				lightning::log_error!(&*logger, "Background processor shutdown failed: {:?}", e);
+			},
+			Err(e) => {
+				lightning::log_error!(&*logger, "Background processor task join failed: {}", e);
+			},
+		}
 	}
 }
 

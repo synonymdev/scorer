@@ -87,6 +87,17 @@ pub(crate) fn read_network(
 		if let Ok(graph) = NetworkGraph::read(&mut BufReader::new(file), logger.clone()) {
 			return graph;
 		}
+		lightning::log_warn!(
+			&*logger,
+			"Failed to deserialize network graph from {}. Starting with empty graph.",
+			path.display()
+		);
+	} else if path.exists() {
+		lightning::log_warn!(
+			&*logger,
+			"Failed to open network graph at {}. Starting with empty graph.",
+			path.display()
+		);
 	}
 	NetworkGraph::new(network, logger)
 }
@@ -96,6 +107,15 @@ pub(crate) fn read_inbound_payment_info(path: &Path) -> InboundPaymentInfoStorag
 		if let Ok(info) = InboundPaymentInfoStorage::read(&mut BufReader::new(file)) {
 			return info;
 		}
+		eprintln!(
+			"WARN: Failed to deserialize inbound payment info from {}. Starting with empty state.",
+			path.display()
+		);
+	} else if path.exists() {
+		eprintln!(
+			"WARN: Failed to open inbound payment info at {}. Starting with empty state.",
+			path.display()
+		);
 	}
 	InboundPaymentInfoStorage { payments: new_hash_map() }
 }
@@ -105,6 +125,15 @@ pub(crate) fn read_outbound_payment_info(path: &Path) -> OutboundPaymentInfoStor
 		if let Ok(info) = OutboundPaymentInfoStorage::read(&mut BufReader::new(file)) {
 			return info;
 		}
+		eprintln!(
+			"WARN: Failed to deserialize outbound payment info from {}. Starting with empty state.",
+			path.display()
+		);
+	} else if path.exists() {
+		eprintln!(
+			"WARN: Failed to open outbound payment info at {}. Starting with empty state.",
+			path.display()
+		);
 	}
 	OutboundPaymentInfoStorage { payments: new_hash_map() }
 }
@@ -118,6 +147,17 @@ pub(crate) fn read_scorer(
 		if let Ok(scorer) = ProbabilisticScorer::read(&mut BufReader::new(file), args) {
 			return scorer;
 		}
+		lightning::log_warn!(
+			&*logger,
+			"Failed to deserialize scorer from {}. Starting with fresh scorer.",
+			path.display()
+		);
+	} else if path.exists() {
+		lightning::log_warn!(
+			&*logger,
+			"Failed to open scorer at {}. Starting with fresh scorer.",
+			path.display()
+		);
 	}
 	ProbabilisticScorer::new(params, graph, logger)
 }

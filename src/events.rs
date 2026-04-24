@@ -61,7 +61,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 			output_script,
 			..
 		} => {
-			let addr = WitnessProgram::from_scriptpubkey(
+			let addr = match WitnessProgram::from_scriptpubkey(
 				output_script.as_bytes(),
 				match network {
 					Network::Bitcoin => bitcoin_bech32::constants::Network::Bitcoin,
@@ -70,17 +70,44 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 					Network::Testnet => bitcoin_bech32::constants::Network::Testnet,
 					_ => bitcoin_bech32::constants::Network::Testnet,
 				},
-			)
-			.expect("Lightning funding tx should always be to a SegWit output")
-			.to_address();
+			) {
+				Ok(addr) => addr.to_address(),
+				Err(e) => {
+					println!("\nERROR: failed to derive funding address from script: {}", e);
+					print!("> ");
+					let _ = std::io::stdout().flush();
+					return;
+				},
+			};
 			let mut outputs = vec![StdHashMap::new()];
 			outputs[0].insert(addr, channel_value_satoshis as f64 / 100_000_000.0);
 			let raw_tx = bitcoind_client.create_raw_transaction(outputs).await;
 			let funded_tx = bitcoind_client.fund_raw_transaction(raw_tx).await;
 			let signed_tx = bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await;
-			assert!(signed_tx.complete);
-			let final_tx: Transaction =
-				encode::deserialize(&crate::hex_utils::to_vec(&signed_tx.hex).unwrap()).unwrap();
+			if !signed_tx.complete {
+				println!("\nERROR: Wallet returned incomplete funding transaction signature");
+				print!("> ");
+				let _ = std::io::stdout().flush();
+				return;
+			}
+			let signed_tx_bytes = match crate::hex_utils::to_vec(&signed_tx.hex) {
+				Some(bytes) => bytes,
+				None => {
+					println!("\nERROR: Failed to decode signed funding transaction hex");
+					print!("> ");
+					let _ = std::io::stdout().flush();
+					return;
+				},
+			};
+			let final_tx: Transaction = match encode::deserialize(&signed_tx_bytes) {
+				Ok(tx) => tx,
+				Err(e) => {
+					println!("\nERROR: Failed to deserialize signed funding transaction: {}", e);
+					print!("> ");
+					let _ = std::io::stdout().flush();
+					return;
+				},
+			};
 			if channel_manager
 				.funding_transaction_generated(temporary_channel_id, counterparty_node_id, final_tx)
 				.is_err()
@@ -99,14 +126,20 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				payment_hash, amount_msat,
 			);
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 			let payment_preimage = match purpose {
 				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::Bolt12RefundPayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
 			};
-			channel_manager.claim_funds(payment_preimage.unwrap());
+			if let Some(preimage) = payment_preimage {
+				channel_manager.claim_funds(preimage);
+			} else {
+				println!("\nERROR: PaymentClaimable event missing payment preimage");
+				print!("> ");
+				let _ = std::io::stdout().flush();
+			}
 		},
 		Event::PaymentClaimed { payment_hash, purpose, amount_msat, .. } => {
 			println!(
@@ -147,15 +180,22 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				}
 				fs_store.write("", "", INBOUND_PAYMENTS_FNAME, inbound.encode())
 			};
-			write_future.await.unwrap();
+			if let Err(e) = write_future.await {
+				println!("ERROR: failed to persist inbound payment state: {}", e);
+			}
 		},
 		Event::PaymentSent {
 			payment_preimage, payment_hash, fee_paid_msat, payment_id, ..
 		} => {
+			let Some(payment_id) = payment_id else {
+				println!("\nWARN: PaymentSent event missing payment_id");
+				return;
+			};
+
 			let write_future = {
 				let mut outbound = outbound_payments.lock().unwrap();
 				for (id, payment) in outbound.payments.iter_mut() {
-					if *id == payment_id.unwrap() {
+					if *id == payment_id {
 						payment.preimage = Some(payment_preimage);
 						payment.status = HTLCStatus::Succeeded;
 						println!(
@@ -176,7 +216,9 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
 			};
-			write_future.await.unwrap();
+			if let Err(e) = write_future.await {
+				println!("ERROR: failed to persist outbound payment state: {}", e);
+			}
 		},
 		Event::OpenChannelRequest {
 			ref temporary_channel_id, ref counterparty_node_id, ..
@@ -242,7 +284,9 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
 			};
-			write_future.await.unwrap();
+			if let Err(e) = write_future.await {
+				println!("ERROR: failed to persist outbound payment failure state: {}", e);
+			}
 		},
 		Event::InvoiceReceived { .. } => {},
 		Event::PaymentForwarded {
@@ -310,7 +354,11 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 		},
 		Event::HTLCHandlingFailed { .. } => {},
 		Event::SpendableOutputs { outputs, channel_id } => {
-			output_sweeper.track_spendable_outputs(outputs, channel_id, false, None).await.unwrap();
+			if let Err(e) =
+				output_sweeper.track_spendable_outputs(outputs, channel_id, false, None).await
+			{
+				println!("ERROR: failed to track spendable outputs: {:?}", e);
+			}
 		},
 		Event::ChannelPending { channel_id, counterparty_node_id, .. } => {
 			println!(

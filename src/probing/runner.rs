@@ -1,9 +1,9 @@
 use super::sender::{prepare_probe, send_probe, ProbeError};
 use super::tracker::{ProbeOutcome, ProbeTracker};
 use super::ProbingScorerLock;
-use crate::cli::ProbingConfig;
 use crate::disk::FilesystemLogger;
 use crate::hex_utils;
+use crate::runtime_config::ProbingConfig;
 use crate::{ChannelManager, NetworkGraph};
 use lightning::routing::gossip::NodeId;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;

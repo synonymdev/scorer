@@ -6,13 +6,11 @@ use crate::{
 };
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
-use bitcoin::network::Network;
 use bitcoin::secp256k1::PublicKey;
 use lightning::chain::channelmonitor::Balance;
 use lightning::ln::channelmanager::{
 	Bolt11InvoiceParameters, OptionalOfferPaymentParams, PaymentId, RecipientOnionFields, Retry,
 };
-use lightning::ln::msgs::SocketAddress;
 use lightning::ln::types::ChannelId;
 use lightning::offers::offer::{self, Offer};
 use lightning::onion_message::dns_resolution::HumanReadableName;
@@ -34,38 +32,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use thiserror::Error;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-
-/// Probing configuration passed from config.toml
-#[derive(Clone)]
-pub(crate) struct ProbingConfig {
-	pub(crate) interval_sec: u64,
-	pub(crate) peers: Vec<String>,
-	pub(crate) amount_msats: Vec<u64>,
-	pub(crate) random_min_amount_msat: u64,
-	pub(crate) random_nodes_per_interval: u64,
-	pub(crate) timeout_sec: u64,
-	pub(crate) probe_delay_sec: u64,
-	pub(crate) peer_delay_sec: u64,
-}
-
-pub(crate) struct LdkUserInfo {
-	pub(crate) bitcoind_rpc_username: String,
-	pub(crate) bitcoind_rpc_password: String,
-	pub(crate) bitcoind_rpc_port: u16,
-	pub(crate) bitcoind_rpc_host: String,
-	pub(crate) ldk_storage_dir_path: String,
-	pub(crate) ldk_peer_listening_port: u16,
-	pub(crate) ldk_announced_listen_addr: Vec<SocketAddress>,
-	pub(crate) ldk_announced_node_name: [u8; 32],
-	pub(crate) network: Network,
-	pub(crate) rapid_gossip_sync_enabled: bool,
-	pub(crate) rapid_gossip_sync_url: Option<String>,
-	pub(crate) rapid_gossip_sync_interval_hours: u64,
-	pub(crate) probing: Option<ProbingConfig>,
-	pub(crate) dns_bootstrap: Option<crate::dns_bootstrap::DnsBootstrapConfig>,
-}
 
 pub(crate) struct CliRuntime {
 	pub(crate) peer_manager: Arc<PeerManager>,
@@ -77,6 +46,26 @@ pub(crate) struct CliRuntime {
 	pub(crate) outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>,
 	pub(crate) output_sweeper: Arc<OutputSweeper>,
 	pub(crate) fs_store: Arc<FilesystemStore>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum CliError {
+	#[error("incorrectly formatted peer info, expected `pubkey@host:port`")]
+	InvalidPeerInfoFormat,
+	#[error("could not resolve `{0}` to a socket address")]
+	PeerAddressResolution(String),
+	#[error("unable to parse peer public key")]
+	InvalidPubkey,
+	#[error("failed to connect to peer")]
+	PeerConnectionFailed,
+	#[error("connection closed before peer handshake completed")]
+	ConnectionClosed,
+	#[error("node has an active channel with this peer, close channels first")]
+	ActiveChannelWithPeer,
+	#[error("could not find connected peer {0}")]
+	PeerNotConnected(PublicKey),
+	#[error("failed to open channel: {0}")]
+	ChannelOpenFailed(String),
 }
 
 pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
@@ -145,15 +134,15 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 							match parse_peer_info(peer_pubkey_and_ip_addr.to_string()) {
 								Ok(info) => info,
 								Err(e) => {
-									println!("{:?}", e.into_inner().unwrap());
+									println!("ERROR: {}", e);
 									continue;
 								},
 							};
 
-						if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone())
-							.await
-							.is_err()
+						if let Err(e) =
+							connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone()).await
 						{
+							println!("ERROR: {}", e);
 							continue;
 						};
 					}
@@ -177,13 +166,15 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 						}
 					}
 
-					let _ = open_channel(
+					if let Err(e) = open_channel(
 						pubkey,
 						chan_amt_sat.unwrap(),
 						announce_channel,
 						with_anchors,
 						channel_manager.clone(),
-					);
+					) {
+						println!("ERROR: {}", e);
+					}
 				},
 				"sendpayment" => {
 					let invoice_str = words.next();
@@ -475,15 +466,13 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 						match parse_peer_info(peer_pubkey_and_ip_addr.unwrap().to_string()) {
 							Ok(info) => info,
 							Err(e) => {
-								println!("{:?}", e.into_inner().unwrap());
+								println!("ERROR: {}", e);
 								continue;
 							},
 						};
-					if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone())
-						.await
-						.is_ok()
-					{
-						println!("SUCCESS: connected to peer {}", pubkey);
+					match connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone()).await {
+						Ok(()) => println!("SUCCESS: connected to peer {}", pubkey),
+						Err(e) => println!("ERROR: {}", e),
 					}
 				},
 				"disconnectpeer" => {
@@ -502,14 +491,13 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 							},
 						};
 
-					if do_disconnect_peer(
+					match do_disconnect_peer(
 						peer_pubkey,
 						peer_manager.clone(),
 						channel_manager.clone(),
-					)
-					.is_ok()
-					{
-						println!("SUCCESS: disconnected from peer {}", peer_pubkey);
+					) {
+						Ok(()) => println!("SUCCESS: disconnected from peer {}", peer_pubkey),
+						Err(e) => println!("ERROR: {}", e),
 					}
 				},
 				"listchannels" => list_channels(&channel_manager, &network_graph),
@@ -874,27 +862,23 @@ fn list_payments(
 
 pub(crate) async fn connect_peer_if_necessary(
 	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManager>,
-) -> Result<(), ()> {
+) -> Result<(), CliError> {
 	if peer_manager.peer_by_node_id(&pubkey).is_some() {
 		return Ok(());
 	}
-	let res = do_connect_peer(pubkey, peer_addr, peer_manager).await;
-	if res.is_err() {
-		println!("ERROR: failed to connect to peer");
-	}
-	res
+	do_connect_peer(pubkey, peer_addr, peer_manager).await
 }
 
 pub(crate) async fn do_connect_peer(
 	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManager>,
-) -> Result<(), ()> {
+) -> Result<(), CliError> {
 	match lightning_net_tokio::connect_outbound(Arc::clone(&peer_manager), pubkey, peer_addr).await
 	{
 		Some(connection_closed_future) => {
 			let mut connection_closed_future = Box::pin(connection_closed_future);
 			loop {
 				tokio::select! {
-					_ = &mut connection_closed_future => return Err(()),
+					_ = &mut connection_closed_future => return Err(CliError::ConnectionClosed),
 					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
 				};
 				if peer_manager.peer_by_node_id(&pubkey).is_some() {
@@ -902,26 +886,24 @@ pub(crate) async fn do_connect_peer(
 				}
 			}
 		},
-		None => Err(()),
+		None => Err(CliError::PeerConnectionFailed),
 	}
 }
 
 fn do_disconnect_peer(
 	pubkey: bitcoin::secp256k1::PublicKey, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>,
-) -> Result<(), ()> {
+) -> Result<(), CliError> {
 	//check for open channels with peer
 	for channel in channel_manager.list_channels() {
 		if channel.counterparty.node_id == pubkey {
-			println!("Error: Node has an active channel with this peer, close any channels first");
-			return Err(());
+			return Err(CliError::ActiveChannelWithPeer);
 		}
 	}
 
 	//check the pubkey matches a valid connected peer
 	if peer_manager.peer_by_node_id(&pubkey).is_none() {
-		println!("Error: Could not find peer {}", pubkey);
-		return Err(());
+		return Err(CliError::PeerNotConnected(pubkey));
 	}
 
 	peer_manager.disconnect_by_node_id(pubkey);
@@ -931,7 +913,7 @@ fn do_disconnect_peer(
 fn open_channel(
 	peer_pubkey: PublicKey, channel_amt_sat: u64, announce_for_forwarding: bool,
 	with_anchors: bool, channel_manager: Arc<ChannelManager>,
-) -> Result<(), ()> {
+) -> Result<(), CliError> {
 	let config = UserConfig {
 		channel_handshake_limits: ChannelHandshakeLimits {
 			// lnd's max to_self_delay is 2016, so we want to be compatible.
@@ -951,10 +933,7 @@ fn open_channel(
 			println!("EVENT: initiated channel with peer {}. ", peer_pubkey);
 			Ok(())
 		},
-		Err(e) => {
-			println!("ERROR: failed to open channel: {:?}", e);
-			Err(())
-		},
+		Err(e) => Err(CliError::ChannelOpenFailed(format!("{:?}", e))),
 	}
 }
 
@@ -1131,27 +1110,47 @@ fn force_close_channel(
 
 pub(crate) fn parse_peer_info(
 	peer_pubkey_and_ip_addr: String,
-) -> Result<(PublicKey, SocketAddr), std::io::Error> {
+) -> Result<(PublicKey, SocketAddr), CliError> {
 	let mut pubkey_and_addr = peer_pubkey_and_ip_addr.split("@");
-	let pubkey = pubkey_and_addr.next();
-	let peer_addr_str = pubkey_and_addr.next();
-	if peer_addr_str.is_none() {
-		return Err(std::io::Error::other(
-			"ERROR: incorrectly formatted peer info. Should be formatted as: `pubkey@host:port`",
+	let pubkey_str = pubkey_and_addr.next().ok_or(CliError::InvalidPeerInfoFormat)?;
+	let peer_addr_str = pubkey_and_addr.next().ok_or(CliError::InvalidPeerInfoFormat)?;
+
+	let mut peer_addrs = peer_addr_str
+		.to_socket_addrs()
+		.map_err(|_| CliError::PeerAddressResolution(peer_addr_str.to_string()))?;
+	let peer_addr = peer_addrs
+		.next()
+		.ok_or_else(|| CliError::PeerAddressResolution(peer_addr_str.to_string()))?;
+
+	let pubkey = hex_utils::to_compressed_pubkey(pubkey_str).ok_or(CliError::InvalidPubkey)?;
+
+	Ok((pubkey, peer_addr))
+}
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn parse_peer_info_accepts_valid_pubkey_and_socket() {
+		let input =
+			"02e89ca9e8da72b33d896bae51d20e7e1f0571cece852d1387b4e2f4ae48c80a85@127.0.0.1:9735"
+				.to_string();
+		let parsed = super::parse_peer_info(input);
+		assert!(parsed.is_ok());
+	}
+
+	#[test]
+	fn parse_peer_info_rejects_missing_separator() {
+		let input =
+			"02e89ca9e8da72b33d896bae51d20e7e1f0571cece852d1387b4e2f4ae48c80a85".to_string();
+		assert!(matches!(
+			super::parse_peer_info(input),
+			Err(super::CliError::InvalidPeerInfoFormat)
 		));
 	}
 
-	let peer_addr = peer_addr_str.unwrap().to_socket_addrs().map(|mut r| r.next());
-	if peer_addr.is_err() || peer_addr.as_ref().unwrap().is_none() {
-		return Err(std::io::Error::other(
-			"ERROR: couldn't parse pubkey@host:port into a socket address",
-		));
+	#[test]
+	fn parse_peer_info_rejects_invalid_pubkey() {
+		let input = "zzzz@127.0.0.1:9735".to_string();
+		assert!(matches!(super::parse_peer_info(input), Err(super::CliError::InvalidPubkey)));
 	}
-
-	let pubkey = hex_utils::to_compressed_pubkey(pubkey.unwrap());
-	if pubkey.is_none() {
-		return Err(std::io::Error::other("ERROR: unable to parse given pubkey for node"));
-	}
-
-	Ok((pubkey.unwrap(), peer_addr.unwrap().unwrap()))
 }
