@@ -68,6 +68,44 @@ impl BlockSource for BitcoindClient {
 /// The minimum feerate we are allowed to send, as specify by LDK.
 const MIN_FEERATE: u32 = 253;
 
+/// Helper used by [`BitcoindClient::poll_for_fee_estimates`] to call
+/// `estimatesmartfee` for one confirmation target, enforce the
+/// `MIN_FEERATE` floor, fall back to `fallback_when_none` when bitcoind
+/// returns no estimate, and preserve the previous stored value when the
+/// RPC itself fails.
+///
+/// Factored out to remove ~140 lines of near-identical copy-paste.
+#[allow(clippy::too_many_arguments)]
+async fn estimate_smartfee<F>(
+	rpc_client: &RpcClient, logger: &FilesystemLogger, conf_target_blocks: u32, mode: &str,
+	fallback_when_none: u32, fallback_target_for_previous: ConfirmationTarget, label: &str,
+	load_current: &F,
+) -> u32
+where
+	F: Fn(ConfirmationTarget) -> u32,
+{
+	let conf_target = serde_json::json!(conf_target_blocks);
+	let estimate_mode = serde_json::json!(mode);
+	match rpc_client
+		.call_method::<FeeResponse>("estimatesmartfee", &[conf_target, estimate_mode])
+		.await
+	{
+		Ok(resp) => match resp.feerate_sat_per_kw {
+			Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+			None => fallback_when_none,
+		},
+		Err(e) => {
+			lightning::log_warn!(
+				logger,
+				"Fee polling {} estimatesmartfee failed: {}. Keeping previous value.",
+				label,
+				e
+			);
+			load_current(fallback_target_for_previous)
+		},
+	}
+}
+
 impl BitcoindClient {
 	pub(crate) async fn new(
 		host: String, port: u16, rpc_user: String, rpc_password: String, network: Network,
@@ -146,124 +184,78 @@ impl BitcoindClient {
 					}
 				};
 
-				let mempoolmin_estimate = {
-					match rpc_client
-						.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => MIN_FEERATE,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling getmempoolinfo failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
-						},
-					}
-				};
-				let background_estimate = {
-					let background_conf_target = serde_json::json!(144);
-					let background_estimate_mode = serde_json::json!("ECONOMICAL");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[background_conf_target, background_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => MIN_FEERATE,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling background estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::AnchorChannelFee)
-						},
-					}
+				// `getmempoolinfo` is shaped differently from
+				// `estimatesmartfee` (different RPC method, different
+				// response type), so it's the one call that cannot go
+				// through `estimate_smartfee`.
+				let mempoolmin_estimate = match rpc_client
+					.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
+					.await
+				{
+					Ok(resp) => resp.feerate_sat_per_kw.map(|f| f.max(MIN_FEERATE)).unwrap_or(MIN_FEERATE),
+					Err(e) => {
+						lightning::log_warn!(
+							&*logger,
+							"Fee polling getmempoolinfo failed: {}. Keeping previous value.",
+							e
+						);
+						load_current(ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
+					},
 				};
 
-				let normal_estimate = {
-					let normal_conf_target = serde_json::json!(18);
-					let normal_estimate_mode = serde_json::json!("ECONOMICAL");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[normal_conf_target, normal_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => 2000,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling normal estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::NonAnchorChannelFee)
-						},
-					}
-				};
-
-				let high_prio_estimate = {
-					let high_prio_conf_target = serde_json::json!(6);
-					let high_prio_estimate_mode = serde_json::json!("CONSERVATIVE");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[high_prio_conf_target, high_prio_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => 5000,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling high-priority estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::UrgentOnChainSweep)
-						},
-					}
-				};
-
-				let very_high_prio_estimate = {
-					let high_prio_conf_target = serde_json::json!(2);
-					let high_prio_estimate_mode = serde_json::json!("CONSERVATIVE");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[high_prio_conf_target, high_prio_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => 50000,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling very-high-priority estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::MaximumFeeEstimate)
-						},
-					}
-				};
+				// Each row:  (conf_target_blocks, mode, fallback_when_rpc_returns_none,
+				//             fallback_target_for_previous_value, human_label)
+				//
+				// Previously this was ~140 lines of 5 near-identical
+				// `match rpc_client.call_method::<FeeResponse>(...)` blocks.
+				// Collapsing to one helper kept every semantic: the
+				// minimum-floor at MIN_FEERATE, the per-target fallback
+				// default, and the per-target "keep previous value on RPC
+				// error" behaviour (via `load_current`).
+				let background_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					144,
+					"ECONOMICAL",
+					MIN_FEERATE,
+					ConfirmationTarget::AnchorChannelFee,
+					"background",
+					&load_current,
+				)
+				.await;
+				let normal_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					18,
+					"ECONOMICAL",
+					2000,
+					ConfirmationTarget::NonAnchorChannelFee,
+					"normal",
+					&load_current,
+				)
+				.await;
+				let high_prio_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					6,
+					"CONSERVATIVE",
+					5000,
+					ConfirmationTarget::UrgentOnChainSweep,
+					"high-priority",
+					&load_current,
+				)
+				.await;
+				let very_high_prio_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					2,
+					"CONSERVATIVE",
+					50000,
+					ConfirmationTarget::MaximumFeeEstimate,
+					"very-high-priority",
+					&load_current,
+				)
+				.await;
 
 				store_fee(ConfirmationTarget::MaximumFeeEstimate, very_high_prio_estimate);
 				store_fee(ConfirmationTarget::UrgentOnChainSweep, high_prio_estimate);
@@ -406,17 +398,23 @@ impl BroadcasterInterface for BitcoindClient {
 			};
 			// This may error due to RL calling `broadcast_transactions` with the same transaction
 			// multiple times, but the error is safe to ignore.
-			match res {
-				Ok(_) => {}
-				Err(e) => {
-					let err_str =
-						e.get_ref().map(|inner| inner.to_string()).unwrap_or_else(|| e.to_string());
-					log_error!(logger,
-						"Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\nTransactions: {:?}",
-						err_str,
-						txn);
-					print!("Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\n> ", err_str);
-				}
+			//
+			// Historically we also emitted a `print!` here so the REPL user
+			// would see the warning; it has been removed because (a) it
+			// duplicated the log line without the timestamp/level prefix,
+			// and (b) it printed without a newline discipline that
+			// interleaved badly with `> ` prompt redraws. The log_error!
+			// entry above reaches the rotating log file in `disk.rs` and
+			// is the canonical record.
+			if let Err(e) = res {
+				let err_str =
+					e.get_ref().map(|inner| inner.to_string()).unwrap_or_else(|| e.to_string());
+				log_error!(
+					logger,
+					"Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\nTransactions: {:?}",
+					err_str,
+					txn
+				);
 			}
 		});
 	}

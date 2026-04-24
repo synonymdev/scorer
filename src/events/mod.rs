@@ -1,28 +1,34 @@
+mod funding;
+
 use crate::bitcoind_client::BitcoindClient;
-use crate::cli;
 use crate::disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
+use crate::net::peer::connect_peer_if_necessary;
 use crate::probing::ProbeTracker;
 use crate::{
-	BumpTxEventHandler, ChannelManager, HTLCStatus, InboundPaymentInfoStorage, MillisatAmount,
-	NetworkGraph, OutboundPaymentInfoStorage, PaymentInfo, PeerManager,
+	prompt, user_err, user_out, user_warn, BumpTxEventHandler, ChannelManager, FilesystemLogger,
+	HTLCStatus, InboundPaymentInfoStorage, MillisatAmount, NetworkGraph,
+	OutboundPaymentInfoStorage, PaymentInfo, PeerManager,
 };
-use bitcoin::blockdata::transaction::Transaction;
-use bitcoin::consensus::encode;
 use bitcoin::network::Network;
-use bitcoin_bech32::WitnessProgram;
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose};
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
 use lightning::sign::EntropySource;
 use lightning::util::hash_tables::hash_map::Entry;
+use lightning::util::logger::Logger;
 use lightning::util::persist::KVStore;
 use lightning::util::ser::Writeable;
 use lightning_persister::fs_store::FilesystemStore;
-use std::collections::HashMap as StdHashMap;
-use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 
+/// All dependencies an event handler needs. Assembled once at startup in
+/// `main.rs` and cheaply cloned into each handler invocation.
+///
+/// Note: `logger` is carried alongside the other collaborators so that
+/// every error path can route through the dual-output macros in
+/// `src/logging.rs` (terminal + log file).
 #[derive(Clone)]
 pub(crate) struct EventContext {
 	pub(crate) channel_manager: Arc<ChannelManager>,
@@ -31,12 +37,19 @@ pub(crate) struct EventContext {
 	pub(crate) keys_manager: Arc<crate::KeysManager>,
 	pub(crate) bump_tx_event_handler: Arc<BumpTxEventHandler>,
 	pub(crate) peer_manager: Arc<PeerManager>,
-	pub(crate) inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
-	pub(crate) outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>,
+	// Phase 4: payment-state mutexes are `tokio::sync::Mutex` so that the
+	// `await` points inside event handlers (e.g. `fs_store.write(...).await`)
+	// can be enforced by `#![deny(clippy::await_holding_lock)]` to NOT hold
+	// the guard. With `std::sync::Mutex` the lint is silent and correctness
+	// depends on careful block-expression scoping. The async variant makes
+	// the invariant a compile-time property.
+	pub(crate) inbound_payments: Arc<AsyncMutex<InboundPaymentInfoStorage>>,
+	pub(crate) outbound_payments: Arc<AsyncMutex<OutboundPaymentInfoStorage>>,
 	pub(crate) fs_store: Arc<FilesystemStore>,
 	pub(crate) output_sweeper: Arc<crate::OutputSweeper>,
 	pub(crate) network: Network,
 	pub(crate) probe_tracker: Arc<Mutex<ProbeTracker>>,
+	pub(crate) logger: Arc<FilesystemLogger>,
 }
 
 pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
@@ -52,6 +65,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 	let output_sweeper = &ctx.output_sweeper;
 	let network = ctx.network;
 	let probe_tracker = &ctx.probe_tracker;
+	let logger = &ctx.logger;
 
 	match event {
 		Event::FundingGenerationReady {
@@ -61,97 +75,27 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 			output_script,
 			..
 		} => {
-			let addr = match WitnessProgram::from_scriptpubkey(
-				output_script.as_bytes(),
-				match network {
-					Network::Bitcoin => bitcoin_bech32::constants::Network::Bitcoin,
-					Network::Regtest => bitcoin_bech32::constants::Network::Regtest,
-					Network::Signet => bitcoin_bech32::constants::Network::Signet,
-					Network::Testnet => bitcoin_bech32::constants::Network::Testnet,
-					_ => bitcoin_bech32::constants::Network::Testnet,
-				},
-			) {
-				Ok(addr) => addr.to_address(),
-				Err(e) => {
-					println!("\nERROR: failed to derive funding address from script: {}", e);
-					print!("> ");
-					let _ = std::io::stdout().flush();
-					return;
-				},
-			};
-			let mut outputs = vec![StdHashMap::new()];
-			outputs[0].insert(addr, channel_value_satoshis as f64 / 100_000_000.0);
-			let raw_tx = match bitcoind_client.create_raw_transaction(outputs).await {
-				Ok(tx) => tx,
-				Err(e) => {
-					println!("\nERROR: failed to create raw funding transaction: {}", e);
-					print!("> ");
-					let _ = std::io::stdout().flush();
-					return;
-				},
-			};
-			let funded_tx = match bitcoind_client.fund_raw_transaction(raw_tx).await {
-				Ok(tx) => tx,
-				Err(e) => {
-					println!("\nERROR: failed to fund raw transaction: {}", e);
-					print!("> ");
-					let _ = std::io::stdout().flush();
-					return;
-				},
-			};
-			let signed_tx =
-				match bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await {
-					Ok(tx) => tx,
-					Err(e) => {
-						println!("\nERROR: failed to sign funding transaction: {}", e);
-						print!("> ");
-						let _ = std::io::stdout().flush();
-						return;
-					},
-				};
-			if !signed_tx.complete {
-				println!("\nERROR: Wallet returned incomplete funding transaction signature");
-				print!("> ");
-				let _ = std::io::stdout().flush();
-				return;
-			}
-			let signed_tx_bytes = match crate::hex_utils::to_vec(&signed_tx.hex) {
-				Some(bytes) => bytes,
-				None => {
-					println!("\nERROR: Failed to decode signed funding transaction hex");
-					print!("> ");
-					let _ = std::io::stdout().flush();
-					return;
-				},
-			};
-			let final_tx: Transaction = match encode::deserialize(&signed_tx_bytes) {
-				Ok(tx) => tx,
-				Err(e) => {
-					println!("\nERROR: Failed to deserialize signed funding transaction: {}", e);
-					print!("> ");
-					let _ = std::io::stdout().flush();
-					return;
-				},
-			};
-			if channel_manager
-				.funding_transaction_generated(temporary_channel_id, counterparty_node_id, final_tx)
-				.is_err()
-			{
-				println!(
-					"\nERROR: Channel went away before we could fund it. The peer disconnected or refused the channel."
-				);
-				print!("> ");
-				let _ = std::io::stdout().flush();
-			}
+			funding::handle_funding_generation_ready(
+				temporary_channel_id,
+				counterparty_node_id,
+				channel_value_satoshis,
+				output_script,
+				network,
+				bitcoind_client,
+				channel_manager,
+				logger,
+			)
+			.await;
 		},
 		Event::FundingTxBroadcastSafe { .. } => {},
 		Event::PaymentClaimable { payment_hash, purpose, amount_msat, .. } => {
-			println!(
+			user_out!(
+				&**logger,
 				"\nEVENT: received payment from payment hash {} of {} millisatoshis",
-				payment_hash, amount_msat,
+				payment_hash,
+				amount_msat
 			);
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 			let payment_preimage = match purpose {
 				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => payment_preimage,
@@ -161,18 +105,18 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 			if let Some(preimage) = payment_preimage {
 				channel_manager.claim_funds(preimage);
 			} else {
-				println!("\nERROR: PaymentClaimable event missing payment preimage");
-				print!("> ");
-				let _ = std::io::stdout().flush();
+				user_err!(&**logger, "PaymentClaimable event missing payment preimage");
+				prompt!();
 			}
 		},
 		Event::PaymentClaimed { payment_hash, purpose, amount_msat, .. } => {
-			println!(
+			user_out!(
+				&**logger,
 				"\nEVENT: claimed payment from payment hash {} of {} millisatoshis",
-				payment_hash, amount_msat,
+				payment_hash,
+				amount_msat
 			);
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 			let (payment_preimage, payment_secret) = match purpose {
 				PaymentPurpose::Bolt11InvoicePayment {
 					payment_preimage, payment_secret, ..
@@ -185,14 +129,14 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				} => (payment_preimage, Some(payment_secret)),
 				PaymentPurpose::SpontaneousPayment(preimage) => (Some(preimage), None),
 			};
+			// Build the persistence future under the guard, then drop the
+			// guard *before* awaiting. This is explicit here (rather than
+			// relying on a block-expression) because the `tokio::sync::Mutex`
+			// guard *can* legally be held across `.await`, but we prefer
+			// not to so that concurrent event handlers don't serialise on
+			// the filesystem write.
 			let write_future = {
-				let mut inbound = match inbound_payments.lock() {
-					Ok(lock) => lock,
-					Err(_) => {
-						println!("ERROR: inbound payments lock poisoned");
-						return;
-					},
-				};
+				let mut inbound = inbound_payments.lock().await;
 				match inbound.payments.entry(payment_hash) {
 					Entry::Occupied(mut e) => {
 						let payment = e.get_mut();
@@ -212,30 +156,25 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				fs_store.write("", "", INBOUND_PAYMENTS_FNAME, inbound.encode())
 			};
 			if let Err(e) = write_future.await {
-				println!("ERROR: failed to persist inbound payment state: {}", e);
+				user_err!(&**logger, "failed to persist inbound payment state: {}", e);
 			}
 		},
 		Event::PaymentSent {
 			payment_preimage, payment_hash, fee_paid_msat, payment_id, ..
 		} => {
 			let Some(payment_id) = payment_id else {
-				println!("\nWARN: PaymentSent event missing payment_id");
+				user_warn!(&**logger, "PaymentSent event missing payment_id");
 				return;
 			};
 
 			let write_future = {
-				let mut outbound = match outbound_payments.lock() {
-					Ok(lock) => lock,
-					Err(_) => {
-						println!("ERROR: outbound payments lock poisoned");
-						return;
-					},
-				};
+				let mut outbound = outbound_payments.lock().await;
 				for (id, payment) in outbound.payments.iter_mut() {
 					if *id == payment_id {
 						payment.preimage = Some(payment_preimage);
 						payment.status = HTLCStatus::Succeeded;
-						println!(
+						user_out!(
+							&**logger,
 							"\nEVENT: successfully sent payment of {} millisatoshis{} from \
 									 payment hash {} with preimage {}",
 							payment.amt_msat,
@@ -247,14 +186,13 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 							payment_hash,
 							payment_preimage
 						);
-						print!("> ");
-						let _ = std::io::stdout().flush();
+						prompt!();
 					}
 				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
 			};
 			if let Err(e) = write_future.await {
-				println!("ERROR: failed to persist outbound payment state: {}", e);
+				user_err!(&**logger, "failed to persist outbound payment state: {}", e);
 			}
 		},
 		Event::OpenChannelRequest {
@@ -271,73 +209,62 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 			);
 
 			if let Err(e) = res {
-				print!(
-					"\nEVENT: Failed to accept inbound channel ({}) from {}: {:?}",
+				user_err!(
+					&**logger,
+					"Failed to accept inbound channel ({}) from {}: {:?}",
 					temporary_channel_id,
 					crate::hex_utils::hex_str(&counterparty_node_id.serialize()),
-					e,
+					e
 				);
 			} else {
-				print!(
+				user_out!(
+					&**logger,
 					"\nEVENT: Accepted inbound channel ({}) from {}",
 					temporary_channel_id,
-					crate::hex_utils::hex_str(&counterparty_node_id.serialize()),
+					crate::hex_utils::hex_str(&counterparty_node_id.serialize())
 				);
 			}
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 		},
 		Event::PaymentPathSuccessful { .. } => {},
 		Event::PaymentPathFailed { .. } => {},
-		Event::ProbeSuccessful { payment_hash, .. } => {
-			if let Ok(mut tracker) = probe_tracker.lock() {
-				tracker.complete_success(&payment_hash);
-			} else {
-				println!("ERROR: probe tracker lock poisoned");
-			}
+		Event::ProbeSuccessful { payment_hash, .. } => match probe_tracker.lock() {
+			Ok(mut tracker) => tracker.complete_success(&payment_hash),
+			Err(_) => user_err!(&**logger, "probe tracker lock poisoned"),
 		},
-		Event::ProbeFailed { payment_hash, .. } => {
-			if let Ok(mut tracker) = probe_tracker.lock() {
-				tracker.complete_failed(&payment_hash);
-			} else {
-				println!("ERROR: probe tracker lock poisoned");
-			}
+		Event::ProbeFailed { payment_hash, .. } => match probe_tracker.lock() {
+			Ok(mut tracker) => tracker.complete_failed(&payment_hash),
+			Err(_) => user_err!(&**logger, "probe tracker lock poisoned"),
 		},
 		Event::PaymentFailed { payment_hash, reason, payment_id, .. } => {
+			let reason = reason.unwrap_or(PaymentFailureReason::RetriesExhausted);
 			if let Some(hash) = payment_hash {
-				print!(
+				user_out!(
+					&**logger,
 					"\nEVENT: Failed to send payment to payment ID {}, payment hash {}: {:?}",
 					payment_id,
 					hash,
-					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
+					reason
 				);
 			} else {
-				print!(
+				user_out!(
+					&**logger,
 					"\nEVENT: Failed fetch invoice for payment ID {}: {:?}",
 					payment_id,
-					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
+					reason
 				);
 			}
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 
 			let write_future = {
-				let mut outbound = match outbound_payments.lock() {
-					Ok(lock) => lock,
-					Err(_) => {
-						println!("ERROR: outbound payments lock poisoned");
-						return;
-					},
-				};
-				if outbound.payments.contains_key(&payment_id) {
-					if let Some(payment) = outbound.payments.get_mut(&payment_id) {
-						payment.status = HTLCStatus::Failed;
-					}
+				let mut outbound = outbound_payments.lock().await;
+				if let Some(payment) = outbound.payments.get_mut(&payment_id) {
+					payment.status = HTLCStatus::Failed;
 				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
 			};
 			if let Err(e) = write_future.await {
-				println!("ERROR: failed to persist outbound payment failure state: {}", e);
+				user_err!(&**logger, "failed to persist outbound payment failure state: {}", e);
 			}
 		},
 		Event::InvoiceReceived { .. } => {},
@@ -391,54 +318,62 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				"?".to_string()
 			};
 			if let Some(fee_earned) = total_fee_earned_msat {
-				println!(
+				user_out!(
+					&**logger,
 					"\nEVENT: Forwarded payment for {} msat{}{}, earning {} msat {}",
-					amt_args, from_prev_str, to_next_str, fee_earned, from_onchain_str
+					amt_args,
+					from_prev_str,
+					to_next_str,
+					fee_earned,
+					from_onchain_str
 				);
 			} else {
-				println!(
+				user_out!(
+					&**logger,
 					"\nEVENT: Forwarded payment for {} msat{}{}, claiming onchain {}",
-					amt_args, from_prev_str, to_next_str, from_onchain_str
+					amt_args,
+					from_prev_str,
+					to_next_str,
+					from_onchain_str
 				);
 			}
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 		},
 		Event::HTLCHandlingFailed { .. } => {},
 		Event::SpendableOutputs { outputs, channel_id } => {
 			if let Err(e) =
 				output_sweeper.track_spendable_outputs(outputs, channel_id, false, None).await
 			{
-				println!("ERROR: failed to track spendable outputs: {:?}", e);
+				user_err!(&**logger, "failed to track spendable outputs: {:?}", e);
 			}
 		},
 		Event::ChannelPending { channel_id, counterparty_node_id, .. } => {
-			println!(
+			user_out!(
+				&**logger,
 				"\nEVENT: Channel {} with peer {} is pending awaiting funding lock-in!",
 				channel_id,
-				crate::hex_utils::hex_str(&counterparty_node_id.serialize()),
+				crate::hex_utils::hex_str(&counterparty_node_id.serialize())
 			);
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 		},
 		Event::ChannelReady { ref channel_id, ref counterparty_node_id, .. } => {
-			println!(
+			user_out!(
+				&**logger,
 				"\nEVENT: Channel {} with peer {} is ready to be used!",
 				channel_id,
-				crate::hex_utils::hex_str(&counterparty_node_id.serialize()),
+				crate::hex_utils::hex_str(&counterparty_node_id.serialize())
 			);
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 		},
 		Event::ChannelClosed { channel_id, reason, counterparty_node_id, .. } => {
-			println!(
+			user_out!(
+				&**logger,
 				"\nEVENT: Channel {} with counterparty {} closed due to: {:?}",
 				channel_id,
 				counterparty_node_id.map(|id| format!("{}", id)).unwrap_or("".to_owned()),
 				reason
 			);
-			print!("> ");
-			let _ = std::io::stdout().flush();
+			prompt!();
 		},
 		Event::DiscardFunding { .. } => {},
 		Event::HTLCIntercepted { .. } => {},
@@ -452,7 +387,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 					if let Ok(sockaddrs) = address.to_socket_addrs() {
 						for addr in sockaddrs {
 							let pm = Arc::clone(&peer_manager);
-							if cli::connect_peer_if_necessary(node_id, addr, pm).await.is_ok() {
+							if connect_peer_if_necessary(node_id, addr, pm).await.is_ok() {
 								return;
 							}
 						}

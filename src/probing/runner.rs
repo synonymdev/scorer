@@ -46,10 +46,13 @@ impl ProbeCompletion {
 
 pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps) {
 	let modes = compute_modes(&probe_config);
-	log_mode_warnings(&probe_config, modes);
+	log_mode_warnings(&probe_config, modes, &deps.logger);
 
 	if !modes.peer_list && !modes.random_graph {
-		println!("WARNING: probing config does not enable any probing mode. Probing disabled.");
+		lightning::log_warn!(
+			&*deps.logger,
+			"Probing config does not enable any probing mode. Probing disabled."
+		);
 		return;
 	}
 
@@ -103,6 +106,7 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 								amount,
 							),
 							probe_timeout,
+							&logger,
 						)
 						.await;
 
@@ -161,6 +165,7 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							&scoring_fee_params,
 						),
 						probe_timeout,
+						&logger,
 					)
 					.await;
 
@@ -184,16 +189,22 @@ fn compute_modes(probe_config: &ProbingConfig) -> ProbingModes {
 	}
 }
 
-fn log_mode_warnings(probe_config: &ProbingConfig, modes: ProbingModes) {
+fn log_mode_warnings(
+	probe_config: &ProbingConfig, modes: ProbingModes, logger: &FilesystemLogger,
+) {
 	let has_peer_targets = !probe_config.peers.is_empty();
 	let has_peer_amounts = !probe_config.amount_msats.is_empty();
 
 	if !modes.peer_list {
 		if !has_peer_targets && has_peer_amounts {
-			println!("WARNING: probing.peers is empty in config.toml. Peer-list probing disabled.");
+			lightning::log_warn!(
+				logger,
+				"probing.peers is empty in config.toml. Peer-list probing disabled."
+			);
 		} else if has_peer_targets && !has_peer_amounts {
-			println!(
-				"WARNING: probing.amount_msats is empty in config.toml. Peer-list probing disabled."
+			lightning::log_warn!(
+				logger,
+				"probing.amount_msats is empty in config.toml. Peer-list probing disabled."
 			);
 		}
 	}
@@ -202,8 +213,9 @@ fn log_mode_warnings(probe_config: &ProbingConfig, modes: ProbingModes) {
 		&& probe_config.random_min_amount_msat > 0
 		&& probe_config.random_nodes_per_interval == 0
 	{
-		println!(
-			"WARNING: probing.random_nodes_per_interval is 0 in config.toml. Random-graph probing disabled."
+		lightning::log_warn!(
+			logger,
+			"probing.random_nodes_per_interval is 0 in config.toml. Random-graph probing disabled."
 		);
 	}
 }
@@ -302,20 +314,43 @@ fn log_probe_completed(
 
 async fn run_probe_attempt(
 	tracker: &Arc<Mutex<ProbeTracker>>, send_result: Result<PaymentHash, ProbeError>,
-	timeout: Duration,
+	timeout: Duration, logger: &FilesystemLogger,
 ) -> ProbeCompletion {
 	let payment_hash = match send_result {
 		Ok(payment_hash) => payment_hash,
 		Err(err) => return ProbeCompletion::SendError(err),
 	};
 
-	let receiver = tracker.lock().unwrap().register_probe(payment_hash);
+	// A poisoned tracker mutex means a different thread panicked while
+	// holding it. We log and report the probe as Dropped rather than
+	// propagating the panic — losing a probe result is strictly better
+	// than taking down the probing task.
+	let receiver = match tracker.lock() {
+		Ok(mut guard) => guard.register_probe(payment_hash),
+		Err(_) => {
+			lightning::log_error!(
+				logger,
+				"Probe tracker mutex poisoned while registering probe {}; treating as dropped",
+				payment_hash
+			);
+			return ProbeCompletion::Dropped(payment_hash);
+		},
+	};
 	match tokio::time::timeout(timeout, receiver).await {
 		Ok(Ok(ProbeOutcome::Success)) => ProbeCompletion::Success(payment_hash),
 		Ok(Ok(ProbeOutcome::Failed)) => ProbeCompletion::Failed(payment_hash),
 		Ok(Err(_)) => ProbeCompletion::Dropped(payment_hash),
 		Err(_) => {
-			tracker.lock().unwrap().mark_timed_out(&payment_hash);
+			match tracker.lock() {
+				Ok(mut guard) => guard.mark_timed_out(&payment_hash),
+				Err(_) => {
+					lightning::log_error!(
+						logger,
+						"Probe tracker mutex poisoned while marking probe {} timed-out",
+						payment_hash
+					);
+				},
+			}
 			ProbeCompletion::Timeout(payment_hash)
 		},
 	}

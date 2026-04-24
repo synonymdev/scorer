@@ -9,23 +9,17 @@ use lightning::routing::router::{
 };
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::types::payment::PaymentHash;
-use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub(super) enum ProbeError {
+	#[error("{0}")]
 	NoRoute(&'static str),
+	// `ProbeSendFailure` has no `Display` impl upstream, so format via Debug.
+	#[error("probe send failed: {0:?}")]
 	SendFailed(channelmanager::ProbeSendFailure),
+	#[error("{0}")]
 	InvalidInput(&'static str),
-}
-
-impl fmt::Display for ProbeError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::NoRoute(err) => write!(f, "{}", err),
-			Self::SendFailed(err) => write!(f, "{:?}", err),
-			Self::InvalidInput(err) => write!(f, "{}", err),
-		}
-	}
 }
 
 pub(super) fn prepare_probe(

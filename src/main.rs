@@ -1,4 +1,9 @@
 #![allow(clippy::drop_non_drop)]
+// Phase 0 guardrail: catches the most common async footgun — holding a
+// std::sync::Mutex / RwLock guard across an `.await` point. This is the
+// lint that makes Phase 4 (tokio::sync::Mutex for payments) a compile-time
+// invariant rather than a careful-code convention.
+#![deny(clippy::await_holding_lock)]
 
 mod args;
 pub mod bitcoind_client;
@@ -9,57 +14,60 @@ mod disk;
 mod dns_bootstrap;
 mod events;
 mod hex_utils;
+#[macro_use]
+mod logging;
+mod net;
+mod persist;
 mod probing;
 mod rapid_sync;
 mod runtime_config;
 mod state;
 mod sweep;
+mod types;
 
+pub(crate) use disk::FilesystemLogger;
 pub(crate) use state::{
 	HTLCStatus, InboundPaymentInfoStorage, MillisatAmount, OutboundPaymentInfoStorage, PaymentInfo,
 };
+pub(crate) use types::{
+	BumpTxEventHandler, ChainMonitor, ChannelManager, GossipVerifier, NetworkGraph, OnionMessenger,
+	OutputSweeper, PeerManager,
+};
 
 use crate::bitcoind_client::BitcoindClient;
-use crate::disk::FilesystemLogger;
+use crate::persist::{ScorerKeyRemappingStore, SCORER_PERSISTENCE_FILE_NAME};
 use bitcoin::io;
 use bitcoin::BlockHash;
 use disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
 use lightning::chain;
 use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
-use lightning::chain::{BestBlock, Filter};
+use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
 use lightning::events::Event;
 use lightning::ln::channelmanager::{self, RecentPaymentDetails};
-use lightning::ln::channelmanager::{
-	ChainParameters, ChannelManagerReadArgs, PaymentId, SimpleArcChannelManager,
-};
-use lightning::ln::peer_handler::{
-	IgnoringMessageHandler, MessageHandler, PeerManager as LdkPeerManager,
-};
-use lightning::onion_message::messenger::{
-	DefaultMessageRouter, OnionMessenger as LdkOnionMessenger,
-};
-use lightning::routing::gossip;
-use lightning::routing::gossip::{NodeId, P2PGossipSync};
+use lightning::ln::channelmanager::{ChainParameters, ChannelManagerReadArgs, PaymentId};
+use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler};
+use lightning::onion_message::messenger::DefaultMessageRouter;
+use lightning::routing::gossip::NodeId;
+use lightning::routing::gossip::P2PGossipSync;
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
-use lightning::sign::{InMemorySigner, KeysManager, NodeSigner};
-use lightning::util::async_poll::AsyncResult;
+use lightning::sign::{KeysManager, NodeSigner};
 use lightning::util::config::UserConfig;
 use lightning::util::logger::Logger;
+// `lightning::util::persist` is imported as `ldk_persist` because our
+// local `crate::persist` module (home of `ScorerKeyRemappingStore`) shadows
+// the upstream name in this file.
+use lightning::util::persist as ldk_persist;
 use lightning::util::persist::{
-	self, KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
-	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
-	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::{ReadableArgs, Writeable};
-use lightning::util::sweep as ldk_sweep;
 use lightning_background_processor::{process_events_async, GossipSync, NO_LIQUIDITY_MANAGER};
 use lightning_block_sync::gossip::TokioSpawner;
 use lightning_block_sync::{init, poll, BlockSourceErrorKind, SpvClient, UnboundedCache};
 use lightning_dns_resolver::OMDomainResolver;
-use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::{thread_rng, Rng};
 use std::convert::TryInto;
@@ -72,133 +80,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-type ChainMonitor = chainmonitor::ChainMonitor<
-	InMemorySigner,
-	Arc<dyn Filter + Send + Sync>,
-	Arc<BitcoindClient>,
-	Arc<BitcoindClient>,
-	Arc<FilesystemLogger>,
-	Arc<
-		MonitorUpdatingPersister<
-			Arc<FilesystemStore>,
-			Arc<FilesystemLogger>,
-			Arc<KeysManager>,
-			Arc<KeysManager>,
-			Arc<BitcoindClient>,
-			Arc<BitcoindClient>,
-		>,
-	>,
-	Arc<KeysManager>,
->;
-
-pub(crate) type GossipVerifier = lightning_block_sync::gossip::GossipVerifier<
-	TokioSpawner,
-	Arc<lightning_block_sync::rpc::RpcClient>,
-	Arc<FilesystemLogger>,
->;
-
-// Note that if you do not use an `OMDomainResolver` here you should use SimpleArcPeerManager
-// instead.
-pub(crate) type PeerManager = LdkPeerManager<
-	SocketDescriptor,
-	Arc<ChannelManager>,
-	Arc<P2PGossipSync<Arc<NetworkGraph>, Arc<GossipVerifier>, Arc<FilesystemLogger>>>,
-	Arc<OnionMessenger>,
-	Arc<FilesystemLogger>,
-	IgnoringMessageHandler,
-	Arc<KeysManager>,
-	Arc<ChainMonitor>,
->;
-
-pub(crate) type ChannelManager =
-	SimpleArcChannelManager<ChainMonitor, BitcoindClient, BitcoindClient, FilesystemLogger>;
-
-pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
-
-// Note that if you do not use an `OMDomainResolver` here you should use SimpleArcOnionMessenger
-// instead.
-type OnionMessenger = LdkOnionMessenger<
-	Arc<KeysManager>,
-	Arc<KeysManager>,
-	Arc<FilesystemLogger>,
-	Arc<ChannelManager>,
-	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<KeysManager>>>,
-	Arc<ChannelManager>,
-	Arc<ChannelManager>,
-	Arc<OMDomainResolver<Arc<ChannelManager>>>,
-	IgnoringMessageHandler,
->;
-
-pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
-	Arc<BitcoindClient>,
-	Arc<Wallet<Arc<BitcoindClient>, Arc<FilesystemLogger>>>,
-	Arc<KeysManager>,
-	Arc<FilesystemLogger>,
->;
-
-pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
-	Arc<BitcoindClient>,
-	Arc<BitcoindClient>,
-	Arc<BitcoindClient>,
-	Arc<dyn Filter + Send + Sync>,
-	Arc<ScorerKeyRemappingStore>,
-	Arc<FilesystemLogger>,
-	Arc<KeysManager>,
->;
-
-const SCORER_PERSISTENCE_FILE_NAME: &str = "scorer";
-
-fn remap_scorer_key<'a>(
-	primary_namespace: &str, secondary_namespace: &str, key: &'a str,
-) -> &'a str {
-	if primary_namespace == SCORER_PERSISTENCE_PRIMARY_NAMESPACE
-		&& secondary_namespace == SCORER_PERSISTENCE_SECONDARY_NAMESPACE
-		&& key == SCORER_PERSISTENCE_KEY
-	{
-		SCORER_PERSISTENCE_FILE_NAME
-	} else {
-		key
-	}
-}
-
-struct ScorerKeyRemappingStore {
-	inner: Arc<FilesystemStore>,
-}
-
-impl ScorerKeyRemappingStore {
-	fn new(inner: Arc<FilesystemStore>) -> Self {
-		Self { inner }
-	}
-}
-
-impl KVStore for ScorerKeyRemappingStore {
-	fn read(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
-	) -> AsyncResult<'static, Vec<u8>, io::Error> {
-		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
-		self.inner.read(primary_namespace, secondary_namespace, key)
-	}
-
-	fn write(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
-	) -> AsyncResult<'static, (), io::Error> {
-		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
-		self.inner.write(primary_namespace, secondary_namespace, key, buf)
-	}
-
-	fn remove(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
-	) -> AsyncResult<'static, (), io::Error> {
-		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
-		self.inner.remove(primary_namespace, secondary_namespace, key, lazy)
-	}
-
-	fn list(
-		&self, primary_namespace: &str, secondary_namespace: &str,
-	) -> AsyncResult<'static, Vec<String>, io::Error> {
-		self.inner.list(primary_namespace, secondary_namespace)
-	}
-}
 async fn start_ldk() {
 	let args = match args::parse_startup_args() {
 		Ok(user_args) => user_args,
@@ -240,7 +121,22 @@ async fn start_ldk() {
 
 	// ## Setup
 	// Step 1: Initialize the Logger
-	let logger = Arc::new(FilesystemLogger::new(ldk_data_dir.clone()));
+	//
+	// This is the earliest thing that can fail *after* the data directory
+	// exists, and the error path here is the ONLY one that is allowed to
+	// `println!` an error message, because no logger is available yet to
+	// receive it. All subsequent bootstrap errors route through the logger
+	// as well as stdout via the `user_err!` macro (see `src/logging.rs`).
+	let logger = match FilesystemLogger::try_new(ldk_data_dir.clone()) {
+		Ok(l) => Arc::new(l),
+		Err(e) => {
+			println!(
+				"ERROR: Failed to initialise filesystem logger at {}/logs: {}",
+				ldk_data_dir, e
+			);
+			return;
+		},
+	};
 
 	// Initialize our bitcoind client.
 	let bitcoind_client = match BitcoindClient::new(
@@ -256,7 +152,7 @@ async fn start_ldk() {
 	{
 		Ok(client) => Arc::new(client),
 		Err(e) => {
-			println!("Failed to connect to bitcoind client: {}", e);
+			user_err!(&*logger, "Failed to connect to bitcoind client: {}", e);
 			return;
 		},
 	};
@@ -265,7 +161,7 @@ async fn start_ldk() {
 	let bitcoind_chain = match bitcoind_client.get_blockchain_info().await {
 		Ok(info) => info.chain,
 		Err(e) => {
-			println!("ERROR: Failed to fetch bitcoind chain info: {}", e);
+			user_err!(&*logger, "Failed to fetch bitcoind chain info: {}", e);
 			return;
 		},
 	};
@@ -277,9 +173,11 @@ async fn start_ldk() {
 			bitcoin::Network::Testnet => "test",
 			_ => "test",
 		} {
-		println!(
+		user_err!(
+			&*logger,
 			"Chain argument ({}) didn't match bitcoind chain ({})",
-			args.network, bitcoind_chain
+			args.network,
+			bitcoind_chain
 		);
 		return;
 	}
@@ -302,8 +200,9 @@ async fn start_ldk() {
 	let keys_seed_path = format!("{}/keys_seed", ldk_data_dir.clone());
 	let keys_seed = if let Ok(seed) = fs::read(keys_seed_path.clone()) {
 		if seed.len() != 32 {
-			println!(
-				"ERROR: Invalid keys seed length in {}. Expected 32 bytes, found {}.",
+			user_err!(
+				&*logger,
+				"Invalid keys seed length in {}. Expected 32 bytes, found {}.",
 				keys_seed_path,
 				seed.len()
 			);
@@ -318,16 +217,16 @@ async fn start_ldk() {
 		match File::create(keys_seed_path.clone()) {
 			Ok(mut f) => {
 				if let Err(e) = std::io::Write::write_all(&mut f, &key) {
-					println!("ERROR: Failed to write node keys seed to disk: {}", e);
+					user_err!(&*logger, "Failed to write node keys seed to disk: {}", e);
 					return;
 				}
 				if let Err(e) = f.sync_all() {
-					println!("ERROR: Failed to sync node keys seed to disk: {}", e);
+					user_err!(&*logger, "Failed to sync node keys seed to disk: {}", e);
 					return;
 				}
 			},
 			Err(e) => {
-				println!("ERROR: Unable to create keys seed file {}: {}", keys_seed_path, e);
+				user_err!(&*logger, "Unable to create keys seed file {}: {}", keys_seed_path, e);
 				return;
 			},
 		}
@@ -336,7 +235,7 @@ async fn start_ldk() {
 	let cur = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
 		Ok(d) => d,
 		Err(e) => {
-			println!("ERROR: System clock appears to be before UNIX_EPOCH: {}", e);
+			user_err!(&*logger, "System clock appears to be before UNIX_EPOCH: {}", e);
 			return;
 		},
 	};
@@ -370,7 +269,7 @@ async fn start_ldk() {
 	let mut channelmonitors = match persister.read_all_channel_monitors_with_updates() {
 		Ok(monitors) => monitors,
 		Err(e) => {
-			println!("ERROR: Failed to read channel monitors from disk: {}", e);
+			user_err!(&*logger, "Failed to read channel monitors from disk: {}", e);
 			return;
 		},
 	};
@@ -393,7 +292,7 @@ async fn start_ldk() {
 	let polled_chain_tip = match init::validate_best_block_header(bitcoind_client.as_ref()).await {
 		Ok(tip) => tip,
 		Err(e) => {
-			println!("ERROR: Failed to fetch best block header and best block: {:?}", e);
+			user_err!(&*logger, "Failed to fetch best block header and best block: {:?}", e);
 			return;
 		},
 	};
@@ -455,7 +354,7 @@ async fn start_ldk() {
 			match <(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args) {
 				Ok(v) => v,
 				Err(e) => {
-					println!("ERROR: Failed to deserialize channel manager: {:?}", e);
+					user_err!(&*logger, "Failed to deserialize channel manager: {:?}", e);
 					return;
 				},
 			}
@@ -521,13 +420,13 @@ async fn start_ldk() {
 			match <(BestBlock, OutputSweeper)>::read(&mut reader, read_args) {
 				Ok(v) => v,
 				Err(e) => {
-					println!("ERROR: Failed to deserialize OutputSweeper: {:?}", e);
+					user_err!(&*logger, "Failed to deserialize OutputSweeper: {:?}", e);
 					return;
 				},
 			}
 		},
 		Err(e) => {
-			println!("ERROR: Failed to read OutputSweeper: {}", e);
+			user_err!(&*logger, "Failed to read OutputSweeper: {}", e);
 			return;
 		},
 	};
@@ -567,7 +466,7 @@ async fn start_ldk() {
 		{
 			Ok(tip) => tip,
 			Err(e) => {
-				println!("ERROR: Failed to synchronize chain listeners: {:?}", e);
+				user_err!(&*logger, "Failed to synchronize chain listeners: {:?}", e);
 				return;
 			},
 		}
@@ -583,7 +482,7 @@ async fn start_ldk() {
 		if chain_monitor.load_existing_monitor(channel_id, channel_monitor)
 			!= Ok(ChannelMonitorUpdateStatus::Completed)
 		{
-			println!("ERROR: Failed to load existing monitor for channel {}", channel_id);
+			user_err!(&*logger, "Failed to load existing monitor for channel {}", channel_id);
 			return;
 		}
 	}
@@ -599,7 +498,6 @@ async fn start_ldk() {
 		match rapid_sync::RapidGossipSyncManager::new(
 			Arc::clone(&network_graph),
 			args.rapid_gossip_sync_url.clone(),
-			Arc::clone(&fs_store),
 			Arc::clone(&logger),
 			ldk_data_dir.clone(),
 		)
@@ -637,12 +535,12 @@ async fn start_ldk() {
 		Ok(mut addrs) => match addrs.next() {
 			Some(addr) => addr,
 			None => {
-				println!("ERROR: Resolver address lookup returned no addresses");
+				user_err!(&*logger, "Resolver address lookup returned no addresses");
 				return;
 			},
 		},
 		Err(e) => {
-			println!("ERROR: Failed to resolve default DNS resolver: {}", e);
+			user_err!(&*logger, "Failed to resolve default DNS resolver: {}", e);
 			return;
 		},
 	};
@@ -665,7 +563,7 @@ async fn start_ldk() {
 	let current_time = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
 		Ok(d) => d.as_secs(),
 		Err(e) => {
-			println!("ERROR: System clock appears to be before UNIX_EPOCH: {}", e);
+			user_err!(&*logger, "System clock appears to be before UNIX_EPOCH: {}", e);
 			return;
 		},
 	};
@@ -682,7 +580,7 @@ async fn start_ldk() {
 		match current_time.try_into() {
 			Ok(ts) => ts,
 			Err(_) => {
-				println!("ERROR: Current timestamp does not fit expected peer-manager type");
+				user_err!(&*logger, "Current timestamp does not fit expected peer-manager type");
 				return;
 			},
 		},
@@ -707,12 +605,17 @@ async fn start_ldk() {
 	let listening_port = args.ldk_peer_listening_port;
 	let stop_listen_connect = Arc::new(AtomicBool::new(false));
 	let stop_listen = Arc::clone(&stop_listen_connect);
+	let listen_logger = Arc::clone(&logger);
 	tokio::spawn(async move {
 		let listener = match tokio::net::TcpListener::bind(format!("[::]:{}", listening_port)).await
 		{
 			Ok(listener) => listener,
 			Err(e) => {
-				eprintln!(
+				// Listener bind failures are fatal for inbound connectivity;
+				// surface via the dual-output macro so operators see the
+				// message whether they run with or without a terminal.
+				user_err!(
+					&*listen_logger,
 					"Failed to bind to listen port {} - is something else already listening on it? {}",
 					listening_port,
 					e
@@ -725,20 +628,29 @@ async fn start_ldk() {
 			let (tcp_stream, _) = match listener.accept().await {
 				Ok(conn) => conn,
 				Err(e) => {
-					eprintln!("Failed to accept inbound connection: {}", e);
+					lightning::log_warn!(
+						&*listen_logger,
+						"Failed to accept inbound connection: {}",
+						e
+					);
 					continue;
 				},
 			};
 			if stop_listen.load(Ordering::Acquire) {
 				return;
 			}
+			let conn_logger = Arc::clone(&listen_logger);
 			tokio::spawn(async move {
 				match tcp_stream.into_std() {
 					Ok(std_stream) => {
 						lightning_net_tokio::setup_inbound(peer_mgr.clone(), std_stream).await;
 					},
 					Err(e) => {
-						eprintln!("Failed to convert inbound TCP stream: {}", e);
+						lightning::log_warn!(
+							&*conn_logger,
+							"Failed to convert inbound TCP stream: {}",
+							e
+						);
 					},
 				}
 			});
@@ -788,12 +700,18 @@ async fn start_ldk() {
 		}
 	});
 
-	let inbound_payments = Arc::new(Mutex::new(disk::read_inbound_payment_info(Path::new(
-		&format!("{}/{}", ldk_data_dir, INBOUND_PAYMENTS_FNAME),
-	))));
-	let outbound_payments = Arc::new(Mutex::new(disk::read_outbound_payment_info(Path::new(
-		&format!("{}/{}", ldk_data_dir, OUTBOUND_PAYMENTS_FNAME),
-	))));
+	// Phase 4: payment storage now uses `tokio::sync::Mutex`. The lock
+	// helper returns a guard directly (not a Result), because a
+	// tokio-mutex cannot be poisoned — there's no panic-propagation path
+	// through an `.await` in the way there is for `std::sync::Mutex`.
+	let inbound_payments = Arc::new(tokio::sync::Mutex::new(disk::read_inbound_payment_info(
+		Path::new(&format!("{}/{}", ldk_data_dir, INBOUND_PAYMENTS_FNAME)),
+		&logger,
+	)));
+	let outbound_payments = Arc::new(tokio::sync::Mutex::new(disk::read_outbound_payment_info(
+		Path::new(&format!("{}/{}", ldk_data_dir, OUTBOUND_PAYMENTS_FNAME)),
+		&logger,
+	)));
 	let recent_payments_payment_ids = channel_manager
 		.list_recent_payments()
 		.into_iter()
@@ -805,13 +723,7 @@ async fn start_ldk() {
 		})
 		.collect::<Vec<PaymentId>>();
 	{
-		let mut outbound_payments_lock = match outbound_payments.lock() {
-			Ok(lock) => lock,
-			Err(_) => {
-				println!("ERROR: Outbound payments lock poisoned");
-				return;
-			},
-		};
+		let mut outbound_payments_lock = outbound_payments.lock().await;
 		for (payment_id, payment_info) in outbound_payments_lock
 			.payments
 			.iter_mut()
@@ -823,17 +735,11 @@ async fn start_ldk() {
 		}
 	}
 	let outbound_payments_bytes = {
-		let outbound_payments_lock = match outbound_payments.lock() {
-			Ok(lock) => lock,
-			Err(_) => {
-				println!("ERROR: Outbound payments lock poisoned");
-				return;
-			},
-		};
+		let outbound_payments_lock = outbound_payments.lock().await;
 		outbound_payments_lock.encode()
 	};
 	if let Err(e) = fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments_bytes).await {
-		println!("ERROR: Failed to persist outbound payments: {}", e);
+		user_err!(&*logger, "Failed to persist outbound payments: {}", e);
 		return;
 	}
 
@@ -852,6 +758,7 @@ async fn start_ldk() {
 		output_sweeper: Arc::clone(&output_sweeper),
 		network: args.network,
 		probe_tracker: Arc::clone(&probe_tracker),
+		logger: Arc::clone(&logger),
 	});
 	let event_handler = move |event: Event| {
 		let event_context = Arc::clone(&event_context);
@@ -1122,6 +1029,7 @@ async fn start_ldk() {
 	let cli_fs_store = Arc::clone(&fs_store);
 	let cli_peer_manager = Arc::clone(&peer_manager);
 	let cli_output_sweeper = Arc::clone(&output_sweeper);
+	let cli_logger = Arc::clone(&logger);
 	let cli_poll = tokio::task::spawn(cli::poll_for_user_input(cli::CliRuntime {
 		peer_manager: cli_peer_manager,
 		channel_manager: cli_channel_manager,
@@ -1132,6 +1040,7 @@ async fn start_ldk() {
 		outbound_payments,
 		output_sweeper: cli_output_sweeper,
 		fs_store: cli_fs_store,
+		logger: cli_logger,
 	}));
 
 	// Exit if either CLI polling exits or the background processor exits (which shouldn't happen
@@ -1152,9 +1061,9 @@ async fn start_ldk() {
 	if let Err(e) = bg_res {
 		if let Err(write_err) = fs_store
 			.write(
-				persist::CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-				persist::CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-				persist::CHANNEL_MANAGER_PERSISTENCE_KEY,
+				ldk_persist::CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+				ldk_persist::CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+				ldk_persist::CHANNEL_MANAGER_PERSISTENCE_KEY,
 				channel_manager.encode(),
 			)
 			.await
