@@ -81,9 +81,34 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 			};
 			let mut outputs = vec![StdHashMap::new()];
 			outputs[0].insert(addr, channel_value_satoshis as f64 / 100_000_000.0);
-			let raw_tx = bitcoind_client.create_raw_transaction(outputs).await;
-			let funded_tx = bitcoind_client.fund_raw_transaction(raw_tx).await;
-			let signed_tx = bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await;
+			let raw_tx = match bitcoind_client.create_raw_transaction(outputs).await {
+				Ok(tx) => tx,
+				Err(e) => {
+					println!("\nERROR: failed to create raw funding transaction: {}", e);
+					print!("> ");
+					let _ = std::io::stdout().flush();
+					return;
+				},
+			};
+			let funded_tx = match bitcoind_client.fund_raw_transaction(raw_tx).await {
+				Ok(tx) => tx,
+				Err(e) => {
+					println!("\nERROR: failed to fund raw transaction: {}", e);
+					print!("> ");
+					let _ = std::io::stdout().flush();
+					return;
+				},
+			};
+			let signed_tx =
+				match bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await {
+					Ok(tx) => tx,
+					Err(e) => {
+						println!("\nERROR: failed to sign funding transaction: {}", e);
+						print!("> ");
+						let _ = std::io::stdout().flush();
+						return;
+					},
+				};
 			if !signed_tx.complete {
 				println!("\nERROR: Wallet returned incomplete funding transaction signature");
 				print!("> ");
@@ -116,7 +141,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 					"\nERROR: Channel went away before we could fund it. The peer disconnected or refused the channel."
 				);
 				print!("> ");
-				std::io::stdout().flush().unwrap();
+				let _ = std::io::stdout().flush();
 			}
 		},
 		Event::FundingTxBroadcastSafe { .. } => {},
@@ -147,7 +172,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				payment_hash, amount_msat,
 			);
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 			let (payment_preimage, payment_secret) = match purpose {
 				PaymentPurpose::Bolt11InvoicePayment {
 					payment_preimage, payment_secret, ..
@@ -161,7 +186,13 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				PaymentPurpose::SpontaneousPayment(preimage) => (Some(preimage), None),
 			};
 			let write_future = {
-				let mut inbound = inbound_payments.lock().unwrap();
+				let mut inbound = match inbound_payments.lock() {
+					Ok(lock) => lock,
+					Err(_) => {
+						println!("ERROR: inbound payments lock poisoned");
+						return;
+					},
+				};
 				match inbound.payments.entry(payment_hash) {
 					Entry::Occupied(mut e) => {
 						let payment = e.get_mut();
@@ -193,7 +224,13 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 			};
 
 			let write_future = {
-				let mut outbound = outbound_payments.lock().unwrap();
+				let mut outbound = match outbound_payments.lock() {
+					Ok(lock) => lock,
+					Err(_) => {
+						println!("ERROR: outbound payments lock poisoned");
+						return;
+					},
+				};
 				for (id, payment) in outbound.payments.iter_mut() {
 					if *id == payment_id {
 						payment.preimage = Some(payment_preimage);
@@ -211,7 +248,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 							payment_preimage
 						);
 						print!("> ");
-						std::io::stdout().flush().unwrap();
+						let _ = std::io::stdout().flush();
 					}
 				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
@@ -248,15 +285,23 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				);
 			}
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 		},
 		Event::PaymentPathSuccessful { .. } => {},
 		Event::PaymentPathFailed { .. } => {},
 		Event::ProbeSuccessful { payment_hash, .. } => {
-			probe_tracker.lock().unwrap().complete_success(&payment_hash);
+			if let Ok(mut tracker) = probe_tracker.lock() {
+				tracker.complete_success(&payment_hash);
+			} else {
+				println!("ERROR: probe tracker lock poisoned");
+			}
 		},
 		Event::ProbeFailed { payment_hash, .. } => {
-			probe_tracker.lock().unwrap().complete_failed(&payment_hash);
+			if let Ok(mut tracker) = probe_tracker.lock() {
+				tracker.complete_failed(&payment_hash);
+			} else {
+				println!("ERROR: probe tracker lock poisoned");
+			}
 		},
 		Event::PaymentFailed { payment_hash, reason, payment_id, .. } => {
 			if let Some(hash) = payment_hash {
@@ -274,13 +319,20 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				);
 			}
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 
 			let write_future = {
-				let mut outbound = outbound_payments.lock().unwrap();
+				let mut outbound = match outbound_payments.lock() {
+					Ok(lock) => lock,
+					Err(_) => {
+						println!("ERROR: outbound payments lock poisoned");
+						return;
+					},
+				};
 				if outbound.payments.contains_key(&payment_id) {
-					let payment = outbound.payments.get_mut(&payment_id).unwrap();
-					payment.status = HTLCStatus::Failed;
+					if let Some(payment) = outbound.payments.get_mut(&payment_id) {
+						payment.status = HTLCStatus::Failed;
+					}
 				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
 			};
@@ -350,7 +402,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				);
 			}
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 		},
 		Event::HTLCHandlingFailed { .. } => {},
 		Event::SpendableOutputs { outputs, channel_id } => {
@@ -367,7 +419,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				crate::hex_utils::hex_str(&counterparty_node_id.serialize()),
 			);
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 		},
 		Event::ChannelReady { ref channel_id, ref counterparty_node_id, .. } => {
 			println!(
@@ -376,7 +428,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				crate::hex_utils::hex_str(&counterparty_node_id.serialize()),
 			);
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 		},
 		Event::ChannelClosed { channel_id, reason, counterparty_node_id, .. } => {
 			println!(
@@ -386,7 +438,7 @@ pub(crate) async fn handle_ldk_events(ctx: Arc<EventContext>, event: Event) {
 				reason
 			);
 			print!("> ");
-			std::io::stdout().flush().unwrap();
+			let _ = std::io::stdout().flush();
 		},
 		Event::DiscardFunding { .. } => {},
 		Event::HTLCIntercepted { .. } => {},

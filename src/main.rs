@@ -262,7 +262,13 @@ async fn start_ldk() {
 	};
 
 	// Check that the bitcoind we've connected to is running the network we expect
-	let bitcoind_chain = bitcoind_client.get_blockchain_info().await.chain;
+	let bitcoind_chain = match bitcoind_client.get_blockchain_info().await {
+		Ok(info) => info.chain,
+		Err(e) => {
+			println!("ERROR: Failed to fetch bitcoind chain info: {}", e);
+			return;
+		},
+	};
 	if bitcoind_chain
 		!= match args.network {
 			bitcoin::Network::Bitcoin => "main",

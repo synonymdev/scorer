@@ -27,6 +27,7 @@ use lightning_block_sync::{AsyncBlockSourceResult, BlockData, BlockHeaderData, B
 use serde_json;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -125,8 +126,25 @@ impl BitcoindClient {
 	) {
 		handle.spawn(async move {
 			loop {
-				let load_current =
-					|target: ConfirmationTarget| fees.get(&target).unwrap().load(Ordering::Acquire);
+				let load_current = |target: ConfirmationTarget| {
+					if let Some(value) = fees.get(&target) {
+						value.load(Ordering::Acquire)
+					} else {
+						lightning::log_error!(
+							&*logger,
+							"Missing fee bucket for {:?}, defaulting to MIN_FEERATE",
+							target
+						);
+						MIN_FEERATE
+					}
+				};
+				let store_fee = |target: ConfirmationTarget, value: u32| {
+					if let Some(slot) = fees.get(&target) {
+						slot.store(value, Ordering::Release);
+					} else {
+						lightning::log_error!(&*logger, "Missing fee bucket for {:?}", target);
+					}
+				};
 
 				let mempoolmin_estimate = {
 					match rpc_client
@@ -247,30 +265,20 @@ impl BitcoindClient {
 					}
 				};
 
-				fees.get(&ConfirmationTarget::MaximumFeeEstimate)
-					.unwrap()
-					.store(very_high_prio_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::UrgentOnChainSweep)
-					.unwrap()
-					.store(high_prio_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
-					.unwrap()
-					.store(mempoolmin_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee)
-					.unwrap()
-					.store(background_estimate.saturating_sub(250), Ordering::Release);
-				fees.get(&ConfirmationTarget::AnchorChannelFee)
-					.unwrap()
-					.store(background_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::NonAnchorChannelFee)
-					.unwrap()
-					.store(normal_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::ChannelCloseMinimum)
-					.unwrap()
-					.store(background_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::OutputSpendingFee)
-					.unwrap()
-					.store(background_estimate, Ordering::Release);
+				store_fee(ConfirmationTarget::MaximumFeeEstimate, very_high_prio_estimate);
+				store_fee(ConfirmationTarget::UrgentOnChainSweep, high_prio_estimate);
+				store_fee(
+					ConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
+					mempoolmin_estimate,
+				);
+				store_fee(
+					ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+					background_estimate.saturating_sub(250),
+				);
+				store_fee(ConfirmationTarget::AnchorChannelFee, background_estimate);
+				store_fee(ConfirmationTarget::NonAnchorChannelFee, normal_estimate);
+				store_fee(ConfirmationTarget::ChannelCloseMinimum, background_estimate);
+				store_fee(ConfirmationTarget::OutputSpendingFee, background_estimate);
 
 				tokio::time::sleep(Duration::from_secs(60)).await;
 			}
@@ -283,15 +291,16 @@ impl BitcoindClient {
 		RpcClient::new(&rpc_credentials, http_endpoint)
 	}
 
-	pub async fn create_raw_transaction(&self, outputs: Vec<HashMap<String, f64>>) -> RawTx {
+	pub async fn create_raw_transaction(
+		&self, outputs: Vec<HashMap<String, f64>>,
+	) -> io::Result<RawTx> {
 		let outputs_json = serde_json::json!(outputs);
 		self.bitcoind_rpc_client
 			.call_method::<RawTx>("createrawtransaction", &[serde_json::json!([]), outputs_json])
 			.await
-			.unwrap()
 	}
 
-	pub async fn fund_raw_transaction(&self, raw_tx: RawTx) -> FundedTx {
+	pub async fn fund_raw_transaction(&self, raw_tx: RawTx) -> io::Result<FundedTx> {
 		let raw_tx_json = serde_json::json!(raw_tx.0);
 		let options = serde_json::json!({
 			// LDK gives us feerates in satoshis per KW but Bitcoin Core here expects fees
@@ -306,57 +315,68 @@ impl BitcoindClient {
 			// change address or to a new channel output negotiated with the same node.
 			"replaceable": false,
 		});
-		self.bitcoind_rpc_client
-			.call_method("fundrawtransaction", &[raw_tx_json, options])
-			.await
-			.unwrap()
+		self.bitcoind_rpc_client.call_method("fundrawtransaction", &[raw_tx_json, options]).await
 	}
 
-	pub async fn send_raw_transaction(&self, raw_tx: RawTx) {
+	pub async fn send_raw_transaction(&self, raw_tx: RawTx) -> io::Result<()> {
 		let raw_tx_json = serde_json::json!(raw_tx.0);
 		self.bitcoind_rpc_client
 			.call_method::<Txid>("sendrawtransaction", &[raw_tx_json])
 			.await
-			.unwrap();
+			.map(|_| ())
 	}
 
 	pub fn sign_raw_transaction_with_wallet(
 		&self, tx_hex: String,
-	) -> impl Future<Output = SignedTx> {
+	) -> impl Future<Output = io::Result<SignedTx>> {
 		let tx_hex_json = serde_json::json!(tx_hex);
 		let rpc_client = self.get_new_rpc_client();
-		async move {
-			rpc_client.call_method("signrawtransactionwithwallet", &[tx_hex_json]).await.unwrap()
-		}
+		async move { rpc_client.call_method("signrawtransactionwithwallet", &[tx_hex_json]).await }
 	}
 
-	pub fn get_new_address(&self) -> impl Future<Output = Address> {
+	pub fn get_new_address(&self) -> impl Future<Output = io::Result<Address>> {
 		let addr_args = [serde_json::json!("LDK output address")];
 		let network = self.network;
 		let rpc_client = self.get_new_rpc_client();
 		async move {
-			let addr =
-				rpc_client.call_method::<NewAddress>("getnewaddress", &addr_args).await.unwrap();
-			Address::from_str(addr.0.as_str()).unwrap().require_network(network).unwrap()
+			let addr = rpc_client.call_method::<NewAddress>("getnewaddress", &addr_args).await?;
+			let parsed = Address::from_str(addr.0.as_str()).map_err(|e| {
+				io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("bitcoind returned invalid address {}: {}", addr.0, e),
+				)
+			})?;
+			parsed.require_network(network).map_err(|e| {
+				io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("bitcoind returned address for wrong network: {}", e),
+				)
+			})
 		}
 	}
 
-	pub async fn get_blockchain_info(&self) -> BlockchainInfo {
-		self.bitcoind_rpc_client
-			.call_method::<BlockchainInfo>("getblockchaininfo", &[])
-			.await
-			.unwrap()
+	pub async fn get_blockchain_info(&self) -> io::Result<BlockchainInfo> {
+		self.bitcoind_rpc_client.call_method::<BlockchainInfo>("getblockchaininfo", &[]).await
 	}
 
-	pub fn list_unspent(&self) -> impl Future<Output = ListUnspentResponse> {
+	pub fn list_unspent(&self) -> impl Future<Output = io::Result<ListUnspentResponse>> {
 		let rpc_client = self.get_new_rpc_client();
-		async move { rpc_client.call_method::<ListUnspentResponse>("listunspent", &[]).await.unwrap() }
+		async move { rpc_client.call_method::<ListUnspentResponse>("listunspent", &[]).await }
 	}
 }
 
 impl FeeEstimator for BitcoindClient {
 	fn get_est_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32 {
-		self.fees.get(&confirmation_target).unwrap().load(Ordering::Acquire)
+		if let Some(fee) = self.fees.get(&confirmation_target) {
+			fee.load(Ordering::Acquire)
+		} else {
+			lightning::log_error!(
+				&*self.logger,
+				"Missing fee bucket for {:?}, defaulting to MIN_FEERATE",
+				confirmation_target
+			);
+			MIN_FEERATE
+		}
 	}
 }
 
@@ -404,14 +424,16 @@ impl BroadcasterInterface for BitcoindClient {
 
 impl ChangeDestinationSource for BitcoindClient {
 	fn get_change_destination_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
-		Box::pin(async move { Ok(self.get_new_address().await.script_pubkey()) })
+		Box::pin(async move {
+			self.get_new_address().await.map(|addr| addr.script_pubkey()).map_err(|_| ())
+		})
 	}
 }
 
 impl WalletSource for BitcoindClient {
 	fn list_confirmed_utxos<'a>(&'a self) -> AsyncResult<'a, Vec<Utxo>, ()> {
 		Box::pin(async move {
-			let utxos = self.list_unspent().await.0;
+			let utxos = self.list_unspent().await.map_err(|_| ())?.0;
 			Ok(utxos
 				.into_iter()
 				.filter_map(|utxo| {
@@ -445,7 +467,9 @@ impl WalletSource for BitcoindClient {
 	}
 
 	fn get_change_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
-		Box::pin(async move { Ok(self.get_new_address().await.script_pubkey()) })
+		Box::pin(async move {
+			self.get_new_address().await.map(|addr| addr.script_pubkey()).map_err(|_| ())
+		})
 	}
 
 	fn sign_psbt<'a>(&'a self, tx: Psbt) -> AsyncResult<'a, Transaction, ()> {
@@ -453,7 +477,7 @@ impl WalletSource for BitcoindClient {
 			let mut tx_bytes = Vec::new();
 			let _ = tx.unsigned_tx.consensus_encode(&mut tx_bytes).map_err(|_| ());
 			let tx_hex = hex_utils::hex_str(&tx_bytes);
-			let signed_tx = self.sign_raw_transaction_with_wallet(tx_hex).await;
+			let signed_tx = self.sign_raw_transaction_with_wallet(tx_hex).await.map_err(|_| ())?;
 			let signed_tx_bytes = hex_utils::to_vec(&signed_tx.hex).ok_or(())?;
 			Transaction::consensus_decode(&mut signed_tx_bytes.as_slice()).map_err(|_| ())
 		})
