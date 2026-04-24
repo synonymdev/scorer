@@ -309,7 +309,7 @@ async fn run_probe_attempt(
 		Err(err) => return ProbeCompletion::SendError(err),
 	};
 
-	let receiver = tracker.lock().unwrap().register_probe(payment_hash.clone());
+	let receiver = tracker.lock().unwrap().register_probe(payment_hash);
 	match tokio::time::timeout(timeout, receiver).await {
 		Ok(Ok(ProbeOutcome::Success)) => ProbeCompletion::Success(payment_hash),
 		Ok(Ok(ProbeOutcome::Failed)) => ProbeCompletion::Failed(payment_hash),

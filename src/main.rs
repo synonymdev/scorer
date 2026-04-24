@@ -1,3 +1,5 @@
+#![allow(clippy::drop_non_drop)]
+
 mod args;
 pub mod bitcoind_client;
 mod cli;
@@ -757,10 +759,8 @@ async fn start_ldk() {
 			payment_info.status = HTLCStatus::Failed;
 		}
 	}
-	fs_store
-		.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.lock().unwrap().encode())
-		.await
-		.unwrap();
+	let outbound_payments_bytes = { outbound_payments.lock().unwrap().encode() };
+	fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments_bytes).await.unwrap();
 
 	// Step 20: Handle LDK Events
 	let probe_tracker = Arc::new(Mutex::new(probing::ProbeTracker::new()));
@@ -1047,17 +1047,17 @@ async fn start_ldk() {
 	let cli_fs_store = Arc::clone(&fs_store);
 	let cli_peer_manager = Arc::clone(&peer_manager);
 	let cli_output_sweeper = Arc::clone(&output_sweeper);
-	let cli_poll = tokio::task::spawn(cli::poll_for_user_input(
-		cli_peer_manager,
-		cli_channel_manager,
-		cli_chain_monitor,
+	let cli_poll = tokio::task::spawn(cli::poll_for_user_input(cli::CliRuntime {
+		peer_manager: cli_peer_manager,
+		channel_manager: cli_channel_manager,
+		chain_monitor: cli_chain_monitor,
 		keys_manager,
 		network_graph,
 		inbound_payments,
 		outbound_payments,
-		cli_output_sweeper,
-		cli_fs_store,
-	));
+		output_sweeper: cli_output_sweeper,
+		fs_store: cli_fs_store,
+	}));
 
 	// Exit if either CLI polling exits or the background processor exits (which shouldn't happen
 	// unless we fail to write to the filesystem).

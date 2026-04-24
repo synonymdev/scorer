@@ -67,13 +67,31 @@ pub(crate) struct LdkUserInfo {
 	pub(crate) dns_bootstrap: Option<crate::dns_bootstrap::DnsBootstrapConfig>,
 }
 
-pub(crate) async fn poll_for_user_input(
-	peer_manager: Arc<PeerManager>, channel_manager: Arc<ChannelManager>,
-	chain_monitor: Arc<ChainMonitor>, keys_manager: Arc<KeysManager>,
-	network_graph: Arc<NetworkGraph>, inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
-	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, output_sweeper: Arc<OutputSweeper>,
-	fs_store: Arc<FilesystemStore>,
-) {
+pub(crate) struct CliRuntime {
+	pub(crate) peer_manager: Arc<PeerManager>,
+	pub(crate) channel_manager: Arc<ChannelManager>,
+	pub(crate) chain_monitor: Arc<ChainMonitor>,
+	pub(crate) keys_manager: Arc<KeysManager>,
+	pub(crate) network_graph: Arc<NetworkGraph>,
+	pub(crate) inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
+	pub(crate) outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>,
+	pub(crate) output_sweeper: Arc<OutputSweeper>,
+	pub(crate) fs_store: Arc<FilesystemStore>,
+}
+
+pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
+	let CliRuntime {
+		peer_manager,
+		channel_manager,
+		chain_monitor,
+		keys_manager,
+		network_graph,
+		inbound_payments,
+		outbound_payments,
+		output_sweeper,
+		fs_store,
+	} = runtime;
+
 	println!(
 		"LDK startup successful. Enter \"help\" to view available commands. Press Ctrl-D to quit."
 	);
@@ -311,6 +329,7 @@ pub(crate) async fn poll_for_user_input(
 							retry_strategy: Retry::Timeout(Duration::from_secs(10)),
 							..Default::default()
 						};
+						#[allow(deprecated)]
 						let pay = |a, b, c, d, e| {
 							channel_manager.pay_for_offer_from_human_readable_name(a, b, c, d, e)
 						};
@@ -377,11 +396,13 @@ pub(crate) async fn poll_for_user_input(
 					.await;
 				},
 				"getoffer" => {
-					let offer_builder = channel_manager.create_offer_builder();
-					if let Err(e) = offer_builder {
-						println!("ERROR: Failed to initiate offer building: {:?}", e);
-						continue;
-					}
+					let offer_builder = match channel_manager.create_offer_builder() {
+						Ok(builder) => builder,
+						Err(e) => {
+							println!("ERROR: Failed to initiate offer building: {:?}", e);
+							continue;
+						},
+					};
 
 					let amt_str = words.next();
 					let offer = if let Some(amt) = amt_str {
@@ -390,18 +411,21 @@ pub(crate) async fn poll_for_user_input(
 							println!("ERROR: getoffer provided payment amount was not a number");
 							continue;
 						}
-						offer_builder.unwrap().amount_msats(amt_msat.unwrap()).build()
+						offer_builder.amount_msats(amt_msat.unwrap()).build()
 					} else {
-						offer_builder.unwrap().build()
+						offer_builder.build()
 					};
 
-					if offer.is_err() {
-						println!("ERROR: Failed to build offer: {:?}", offer.unwrap_err());
-					} else {
-						// Note that unlike BOLT11 invoice creation we don't bother to add a
-						// pending inbound payment here, as offers can be reused and don't
-						// correspond with individual payments.
-						println!("{}", offer.unwrap());
+					match offer {
+						Err(e) => {
+							println!("ERROR: Failed to build offer: {:?}", e);
+						},
+						Ok(offer) => {
+							// Note that unlike BOLT11 invoice creation we don't bother to add a
+							// pending inbound payment here, as offers can be reused and don't
+							// correspond with individual payments.
+							println!("{}", offer);
+						},
 					}
 				},
 				"getinvoice" => {

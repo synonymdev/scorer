@@ -55,7 +55,7 @@ impl ProbeTracker {
 		self.prune_timed_out_probes();
 		self.pending_probes.remove(payment_hash);
 		self.completed_probes.remove(payment_hash);
-		self.timed_out_probes.insert(payment_hash.clone(), Instant::now());
+		self.timed_out_probes.insert(*payment_hash, Instant::now());
 	}
 
 	fn complete_probe(&mut self, payment_hash: &PaymentHash, outcome: ProbeOutcome) {
@@ -67,7 +67,7 @@ impl ProbeTracker {
 		if let Some(sender) = self.pending_probes.remove(payment_hash) {
 			let _ = sender.send(outcome);
 		} else {
-			self.completed_probes.insert(payment_hash.clone(), outcome);
+			self.completed_probes.insert(*payment_hash, outcome);
 		}
 	}
 
@@ -85,7 +85,7 @@ impl ProbeTracker {
 		let mut by_age = self
 			.timed_out_probes
 			.iter()
-			.map(|(payment_hash, timed_out_at)| (payment_hash.clone(), *timed_out_at))
+			.map(|(payment_hash, timed_out_at)| (*payment_hash, *timed_out_at))
 			.collect::<Vec<_>>();
 		by_age.sort_by_key(|(_, timed_out_at)| *timed_out_at);
 
