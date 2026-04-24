@@ -90,7 +90,7 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 						continue;
 					};
 
-					'amounts: for &amount in &sorted_amounts {
+					for &amount in &sorted_amounts {
 						let completion = run_probe_attempt(
 							&tracker,
 							prepare_probe(
@@ -110,7 +110,7 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 						sleep_probe_delay(probe_delay).await;
 
 						if completion.should_break_peer_amounts() {
-							break 'amounts;
+							break;
 						}
 					}
 
