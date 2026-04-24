@@ -90,7 +90,7 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 	let mut input = BufReader::new(tokio::io::stdin()).lines();
 	'read_command: loop {
 		print!("> ");
-		std::io::stdout().flush().unwrap(); // Without flushing, the `>` doesn't print
+		let _ = std::io::stdout().flush(); // Without flushing, the `>` doesn't print
 		let line = match input.next_line().await {
 			Ok(Some(l)) => l,
 			Err(e) => {
@@ -106,83 +106,91 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 			match word {
 				"help" => help(),
 				"openchannel" => {
-					let peer_pubkey_and_ip_addr = words.next();
-					let channel_value_sat = words.next();
-					if peer_pubkey_and_ip_addr.is_none() || channel_value_sat.is_none() {
-						println!("ERROR: openchannel has 2 required arguments: `openchannel pubkey@host:port channel_amt_satoshis` [--public] [--with-anchors]");
-						continue;
-					}
-					let peer_pubkey_and_ip_addr = peer_pubkey_and_ip_addr.unwrap();
+					let (peer_pubkey_and_ip_addr, channel_value_sat) = match (
+						words.next(),
+						words.next(),
+					) {
+						(Some(peer), Some(amount)) => (peer, amount),
+						_ => {
+							println!("ERROR: openchannel has 2 required arguments: `openchannel pubkey@host:port channel_amt_satoshis` [--public] [--with-anchors]");
+							continue;
+						},
+					};
 
 					let mut pubkey_and_addr = peer_pubkey_and_ip_addr.split("@");
-					let pubkey = pubkey_and_addr.next();
+					let pubkey = pubkey_and_addr.next().unwrap_or("");
 					let peer_addr_str = pubkey_and_addr.next();
-					let pubkey = hex_utils::to_compressed_pubkey(pubkey.unwrap());
-					if pubkey.is_none() {
+					let pubkey = hex_utils::to_compressed_pubkey(pubkey);
+					if let Some(pubkey) = pubkey {
+						if peer_addr_str.is_none() {
+							if peer_manager.peer_by_node_id(&pubkey).is_none() {
+								println!(
+									"ERROR: Peer address not provided and peer is not connected"
+								);
+								continue;
+							}
+						} else {
+							let (pubkey, peer_addr) =
+								match parse_peer_info(peer_pubkey_and_ip_addr.to_string()) {
+									Ok(info) => info,
+									Err(e) => {
+										println!("ERROR: {}", e);
+										continue;
+									},
+								};
+
+							if let Err(e) =
+								connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone())
+									.await
+							{
+								println!("ERROR: {}", e);
+								continue;
+							};
+						}
+
+						let chan_amt_sat: u64 = match channel_value_sat.parse() {
+							Ok(amount) => amount,
+							Err(_) => {
+								println!("ERROR: channel amount must be a number");
+								continue;
+							},
+						};
+						let (mut announce_channel, mut with_anchors) = (false, false);
+						for word in words.by_ref() {
+							match word {
+								"--public" | "--public=true" => announce_channel = true,
+								"--public=false" => announce_channel = false,
+								"--with-anchors" | "--with-anchors=true" => with_anchors = true,
+								"--with-anchors=false" => with_anchors = false,
+								_ => {
+									println!("ERROR: invalid boolean flag format. Valid formats: `--option`, `--option=true` `--option=false`");
+									continue;
+								},
+							}
+						}
+
+						if let Err(e) = open_channel(
+							pubkey,
+							chan_amt_sat,
+							announce_channel,
+							with_anchors,
+							channel_manager.clone(),
+						) {
+							println!("ERROR: {}", e);
+						}
+					} else {
 						println!("ERROR: unable to parse given pubkey for node");
 						continue;
 					}
-					let pubkey = pubkey.unwrap();
-
-					if peer_addr_str.is_none() {
-						if peer_manager.peer_by_node_id(&pubkey).is_none() {
-							println!("ERROR: Peer address not provided and peer is not connected");
-							continue;
-						}
-					} else {
-						let (pubkey, peer_addr) =
-							match parse_peer_info(peer_pubkey_and_ip_addr.to_string()) {
-								Ok(info) => info,
-								Err(e) => {
-									println!("ERROR: {}", e);
-									continue;
-								},
-							};
-
-						if let Err(e) =
-							connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone()).await
-						{
-							println!("ERROR: {}", e);
-							continue;
-						};
-					}
-
-					let chan_amt_sat: Result<u64, _> = channel_value_sat.unwrap().parse();
-					if chan_amt_sat.is_err() {
-						println!("ERROR: channel amount must be a number");
-						continue;
-					}
-					let (mut announce_channel, mut with_anchors) = (false, false);
-					for word in words.by_ref() {
-						match word {
-							"--public" | "--public=true" => announce_channel = true,
-							"--public=false" => announce_channel = false,
-							"--with-anchors" | "--with-anchors=true" => with_anchors = true,
-							"--with-anchors=false" => with_anchors = false,
-							_ => {
-								println!("ERROR: invalid boolean flag format. Valid formats: `--option`, `--option=true` `--option=false`");
-								continue;
-							},
-						}
-					}
-
-					if let Err(e) = open_channel(
-						pubkey,
-						chan_amt_sat.unwrap(),
-						announce_channel,
-						with_anchors,
-						channel_manager.clone(),
-					) {
-						println!("ERROR: {}", e);
-					}
 				},
 				"sendpayment" => {
-					let invoice_str = words.next();
-					if invoice_str.is_none() {
-						println!("ERROR: sendpayment requires an invoice: `sendpayment <invoice> [amount_msat]`");
-						continue;
-					}
-					let invoice_str = invoice_str.unwrap();
+					let invoice_str = match words.next() {
+						Some(invoice) => invoice,
+						None => {
+							println!("ERROR: sendpayment requires an invoice: `sendpayment <invoice> [amount_msat]`");
+							continue;
+						},
+					};
 
 					let mut user_provided_amt: Option<u64> = None;
 					if let Some(amt_msat_str) = words.next() {
@@ -214,7 +222,7 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 
 						while user_provided_amt.is_none() {
 							print!("Paying offer for {} msat. Continue (Y/N)? >", amt_msat);
-							std::io::stdout().flush().unwrap();
+							let _ = std::io::stdout().flush();
 
 							let line = match input.next_line().await {
 								Ok(Some(l)) => l,
@@ -236,19 +244,34 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 							}
 						}
 
-						outbound_payments.lock().unwrap().payments.insert(
-							payment_id,
-							PaymentInfo {
-								preimage: None,
-								secret: None,
-								status: HTLCStatus::Pending,
-								amt_msat: MillisatAmount(Some(amt_msat)),
-							},
-						);
-						fs_store
-							.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
-							.await
-							.unwrap();
+						let write_future = {
+							let mut outbound_payments = match outbound_payments.lock() {
+								Ok(lock) => lock,
+								Err(_) => {
+									println!("ERROR: outbound payments lock poisoned");
+									continue;
+								},
+							};
+							outbound_payments.payments.insert(
+								payment_id,
+								PaymentInfo {
+									preimage: None,
+									secret: None,
+									status: HTLCStatus::Pending,
+									amt_msat: MillisatAmount(Some(amt_msat)),
+								},
+							);
+							fs_store.write(
+								"",
+								"",
+								OUTBOUND_PAYMENTS_FNAME,
+								outbound_payments.encode(),
+							)
+						};
+						if let Err(e) = write_future.await {
+							println!("ERROR: failed to persist outbound payments: {}", e);
+							continue;
+						}
 
 						let params = OptionalOfferPaymentParams {
 							retry_strategy: Retry::Timeout(Duration::from_secs(10)),
@@ -301,20 +324,38 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 							continue;
 						}
 
-						let amt_msat = user_provided_amt.unwrap();
-						outbound_payments.lock().unwrap().payments.insert(
-							payment_id,
-							PaymentInfo {
-								preimage: None,
-								secret: None,
-								status: HTLCStatus::Pending,
-								amt_msat: MillisatAmount(Some(amt_msat)),
-							},
-						);
-						fs_store
-							.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
-							.await
-							.unwrap();
+						let Some(amt_msat) = user_provided_amt else {
+							println!("Can't pay to a human-readable-name without an amount");
+							continue;
+						};
+						let write_future = {
+							let mut outbound_payments = match outbound_payments.lock() {
+								Ok(lock) => lock,
+								Err(_) => {
+									println!("ERROR: outbound payments lock poisoned");
+									continue;
+								},
+							};
+							outbound_payments.payments.insert(
+								payment_id,
+								PaymentInfo {
+									preimage: None,
+									secret: None,
+									status: HTLCStatus::Pending,
+									amt_msat: MillisatAmount(Some(amt_msat)),
+								},
+							);
+							fs_store.write(
+								"",
+								"",
+								OUTBOUND_PAYMENTS_FNAME,
+								outbound_payments.encode(),
+							)
+						};
+						if let Err(e) = write_future.await {
+							println!("ERROR: failed to persist outbound payments: {}", e);
+							continue;
+						}
 
 						let params = OptionalOfferPaymentParams {
 							retry_strategy: Retry::Timeout(Duration::from_secs(10)),
@@ -397,12 +438,16 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 
 					let amt_str = words.next();
 					let offer = if let Some(amt) = amt_str {
-						let amt_msat: Result<u64, _> = amt.parse();
-						if amt_msat.is_err() {
-							println!("ERROR: getoffer provided payment amount was not a number");
-							continue;
-						}
-						offer_builder.amount_msats(amt_msat.unwrap()).build()
+						let amt_msat: u64 = match amt.parse() {
+							Ok(v) => v,
+							Err(_) => {
+								println!(
+									"ERROR: getoffer provided payment amount was not a number"
+								);
+								continue;
+							},
+						};
+						offer_builder.amount_msats(amt_msat).build()
 					} else {
 						offer_builder.build()
 					};
@@ -420,50 +465,63 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 					}
 				},
 				"getinvoice" => {
-					let amt_str = words.next();
-					if amt_str.is_none() {
-						println!("ERROR: getinvoice requires an amount in millisatoshis");
-						continue;
-					}
+					let amt_str = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: getinvoice requires an amount in millisatoshis");
+							continue;
+						},
+					};
 
-					let amt_msat: Result<u64, _> = amt_str.unwrap().parse();
-					if amt_msat.is_err() {
-						println!("ERROR: getinvoice provided payment amount was not a number");
-						continue;
-					}
+					let amt_msat: u64 = match amt_str.parse() {
+						Ok(v) => v,
+						Err(_) => {
+							println!("ERROR: getinvoice provided payment amount was not a number");
+							continue;
+						},
+					};
 
-					let expiry_secs_str = words.next();
-					if expiry_secs_str.is_none() {
-						println!("ERROR: getinvoice requires an expiry in seconds");
-						continue;
-					}
+					let expiry_secs_str = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: getinvoice requires an expiry in seconds");
+							continue;
+						},
+					};
 
-					let expiry_secs: Result<u32, _> = expiry_secs_str.unwrap().parse();
-					if expiry_secs.is_err() {
-						println!("ERROR: getinvoice provided expiry was not a number");
-						continue;
-					}
+					let expiry_secs: u32 = match expiry_secs_str.parse() {
+						Ok(v) => v,
+						Err(_) => {
+							println!("ERROR: getinvoice provided expiry was not a number");
+							continue;
+						},
+					};
 
 					let write_future = {
-						let mut inbound_payments = inbound_payments.lock().unwrap();
-						get_invoice(
-							amt_msat.unwrap(),
-							&mut inbound_payments,
-							&channel_manager,
-							expiry_secs.unwrap(),
-						);
+						let mut inbound_payments = match inbound_payments.lock() {
+							Ok(lock) => lock,
+							Err(_) => {
+								println!("ERROR: inbound payments lock poisoned");
+								continue;
+							},
+						};
+						get_invoice(amt_msat, &mut inbound_payments, &channel_manager, expiry_secs);
 						fs_store.write("", "", INBOUND_PAYMENTS_FNAME, inbound_payments.encode())
 					};
-					write_future.await.unwrap();
+					if let Err(e) = write_future.await {
+						println!("ERROR: failed to persist inbound payments: {}", e);
+					}
 				},
 				"connectpeer" => {
-					let peer_pubkey_and_ip_addr = words.next();
-					if peer_pubkey_and_ip_addr.is_none() {
-						println!("ERROR: connectpeer requires peer connection info: `connectpeer pubkey@host:port`");
-						continue;
-					}
+					let peer_pubkey_and_ip_addr = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: connectpeer requires peer connection info: `connectpeer pubkey@host:port`");
+							continue;
+						},
+					};
 					let (pubkey, peer_addr) =
-						match parse_peer_info(peer_pubkey_and_ip_addr.unwrap().to_string()) {
+						match parse_peer_info(peer_pubkey_and_ip_addr.to_string()) {
 							Ok(info) => info,
 							Err(e) => {
 								println!("ERROR: {}", e);
@@ -476,20 +534,21 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 					}
 				},
 				"disconnectpeer" => {
-					let peer_pubkey = words.next();
-					if peer_pubkey.is_none() {
-						println!("ERROR: disconnectpeer requires peer public key: `disconnectpeer <peer_pubkey>`");
-						continue;
-					}
+					let peer_pubkey = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: disconnectpeer requires peer public key: `disconnectpeer <peer_pubkey>`");
+							continue;
+						},
+					};
 
-					let peer_pubkey =
-						match bitcoin::secp256k1::PublicKey::from_str(peer_pubkey.unwrap()) {
-							Ok(pubkey) => pubkey,
-							Err(e) => {
-								println!("ERROR: {}", e);
-								continue;
-							},
-						};
+					let peer_pubkey = match bitcoin::secp256k1::PublicKey::from_str(peer_pubkey) {
+						Ok(pubkey) => pubkey,
+						Err(e) => {
+							println!("ERROR: {}", e);
+							continue;
+						},
+					};
 
 					match do_disconnect_peer(
 						peer_pubkey,
@@ -501,30 +560,49 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 					}
 				},
 				"listchannels" => list_channels(&channel_manager, &network_graph),
-				"listpayments" => list_payments(
-					&inbound_payments.lock().unwrap(),
-					&outbound_payments.lock().unwrap(),
-				),
+				"listpayments" => {
+					let inbound = match inbound_payments.lock() {
+						Ok(lock) => lock,
+						Err(_) => {
+							println!("ERROR: inbound payments lock poisoned");
+							continue;
+						},
+					};
+					let outbound = match outbound_payments.lock() {
+						Ok(lock) => lock,
+						Err(_) => {
+							println!("ERROR: outbound payments lock poisoned");
+							continue;
+						},
+					};
+					list_payments(&inbound, &outbound);
+				},
 				"closechannel" => {
-					let channel_id_str = words.next();
-					if channel_id_str.is_none() {
-						println!("ERROR: closechannel requires a channel ID: `closechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
-					if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
-						println!("ERROR: couldn't parse channel_id");
-						continue;
-					}
+					let channel_id_str = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: closechannel requires a channel ID: `closechannel <channel_id> <peer_pubkey>`");
+							continue;
+						},
+					};
+					let channel_id_vec = match hex_utils::to_vec(channel_id_str) {
+						Some(v) if v.len() == 32 => v,
+						_ => {
+							println!("ERROR: couldn't parse channel_id");
+							continue;
+						},
+					};
 					let mut channel_id = [0; 32];
-					channel_id.copy_from_slice(&channel_id_vec.unwrap());
+					channel_id.copy_from_slice(&channel_id_vec);
 
-					let peer_pubkey_str = words.next();
-					if peer_pubkey_str.is_none() {
-						println!("ERROR: closechannel requires a peer pubkey: `closechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+					let peer_pubkey_str = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: closechannel requires a peer pubkey: `closechannel <channel_id> <peer_pubkey>`");
+							continue;
+						},
+					};
+					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str) {
 						Some(peer_pubkey_vec) => peer_pubkey_vec,
 						None => {
 							println!("ERROR: couldn't parse peer_pubkey");
@@ -542,25 +620,31 @@ pub(crate) async fn poll_for_user_input(runtime: CliRuntime) {
 					close_channel(channel_id, peer_pubkey, channel_manager.clone());
 				},
 				"forceclosechannel" => {
-					let channel_id_str = words.next();
-					if channel_id_str.is_none() {
-						println!("ERROR: forceclosechannel requires a channel ID: `forceclosechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
-					if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
-						println!("ERROR: couldn't parse channel_id");
-						continue;
-					}
+					let channel_id_str = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: forceclosechannel requires a channel ID: `forceclosechannel <channel_id> <peer_pubkey>`");
+							continue;
+						},
+					};
+					let channel_id_vec = match hex_utils::to_vec(channel_id_str) {
+						Some(v) if v.len() == 32 => v,
+						_ => {
+							println!("ERROR: couldn't parse channel_id");
+							continue;
+						},
+					};
 					let mut channel_id = [0; 32];
-					channel_id.copy_from_slice(&channel_id_vec.unwrap());
+					channel_id.copy_from_slice(&channel_id_vec);
 
-					let peer_pubkey_str = words.next();
-					if peer_pubkey_str.is_none() {
-						println!("ERROR: forceclosechannel requires a peer pubkey: `forceclosechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+					let peer_pubkey_str = match words.next() {
+						Some(v) => v,
+						None => {
+							println!("ERROR: forceclosechannel requires a peer pubkey: `forceclosechannel <channel_id> <peer_pubkey>`");
+							continue;
+						},
+					};
+					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str) {
 						Some(peer_pubkey_vec) => peer_pubkey_vec,
 						None => {
 							println!("ERROR: couldn't parse peer_pubkey");
@@ -964,7 +1048,13 @@ async fn send_payment(
 		},
 	};
 	let write_future = {
-		let mut outbound_payments = outbound_payments.lock().unwrap();
+		let mut outbound_payments = match outbound_payments.lock() {
+			Ok(lock) => lock,
+			Err(_) => {
+				println!("ERROR: outbound payments lock poisoned");
+				return;
+			},
+		};
 		outbound_payments.payments.insert(
 			payment_id,
 			PaymentInfo {
@@ -976,7 +1066,11 @@ async fn send_payment(
 		);
 		fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
 	};
-	write_future.await.unwrap();
+	if let Err(e) = write_future.await {
+		println!("ERROR: failed to persist outbound payments: {}", e);
+		print!("> ");
+		return;
+	}
 
 	match channel_manager.pay_for_bolt11_invoice(
 		invoice,
@@ -994,12 +1088,21 @@ async fn send_payment(
 			println!("ERROR: failed to send payment: {:?}", e);
 			print!("> ");
 			let write_future = {
-				let mut outbound_payments = outbound_payments.lock().unwrap();
-				outbound_payments.payments.get_mut(&payment_id).unwrap().status =
-					HTLCStatus::Failed;
+				let mut outbound_payments = match outbound_payments.lock() {
+					Ok(lock) => lock,
+					Err(_) => {
+						println!("ERROR: outbound payments lock poisoned");
+						return;
+					},
+				};
+				if let Some(payment) = outbound_payments.payments.get_mut(&payment_id) {
+					payment.status = HTLCStatus::Failed;
+				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
 			};
-			write_future.await.unwrap();
+			if let Err(write_err) = write_future.await {
+				println!("ERROR: failed to persist outbound payments: {}", write_err);
+			}
 		},
 	};
 }
@@ -1016,7 +1119,13 @@ async fn keysend<E: EntropySource>(
 		amt_msat,
 	);
 	let write_future = {
-		let mut outbound_payments = outbound_payments.lock().unwrap();
+		let mut outbound_payments = match outbound_payments.lock() {
+			Ok(lock) => lock,
+			Err(_) => {
+				println!("ERROR: outbound payments lock poisoned");
+				return;
+			},
+		};
 		outbound_payments.payments.insert(
 			payment_id,
 			PaymentInfo {
@@ -1028,7 +1137,11 @@ async fn keysend<E: EntropySource>(
 		);
 		fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
 	};
-	write_future.await.unwrap();
+	if let Err(e) = write_future.await {
+		println!("ERROR: failed to persist outbound payments: {}", e);
+		print!("> ");
+		return;
+	}
 	match channel_manager.send_spontaneous_payment(
 		Some(payment_preimage),
 		RecipientOnionFields::spontaneous_empty(),
@@ -1044,12 +1157,21 @@ async fn keysend<E: EntropySource>(
 			println!("ERROR: failed to send payment: {:?}", e);
 			print!("> ");
 			let write_future = {
-				let mut outbound_payments = outbound_payments.lock().unwrap();
-				outbound_payments.payments.get_mut(&payment_id).unwrap().status =
-					HTLCStatus::Failed;
+				let mut outbound_payments = match outbound_payments.lock() {
+					Ok(lock) => lock,
+					Err(_) => {
+						println!("ERROR: outbound payments lock poisoned");
+						return;
+					},
+				};
+				if let Some(payment) = outbound_payments.payments.get_mut(&payment_id) {
+					payment.status = HTLCStatus::Failed;
+				}
 				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
 			};
-			write_future.await.unwrap();
+			if let Err(write_err) = write_future.await {
+				println!("ERROR: failed to persist outbound payments: {}", write_err);
+			}
 		},
 	};
 }
