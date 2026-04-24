@@ -3,6 +3,7 @@ use crate::disk::FilesystemLogger;
 use crate::hex_utils;
 use crate::{ChannelManager, NetworkGraph};
 use bitcoin::secp256k1::PublicKey;
+use lightning::ln::channelmanager;
 use lightning::routing::gossip::NodeId;
 use lightning::routing::router::{
 	PaymentParameters, RouteParameters, ScorerAccountingForInFlightHtlcs,
@@ -33,6 +34,13 @@ pub(crate) struct ProbingDeps {
 enum ProbeOutcome {
 	Success,
 	Failed,
+}
+
+#[derive(Debug)]
+enum ProbeError {
+	NoRoute(&'static str),
+	SendFailed(channelmanager::ProbeSendFailure),
+	InvalidInput(&'static str),
 }
 
 pub(crate) struct ProbeTracker {
@@ -121,9 +129,7 @@ impl ProbeTracker {
 
 #[cfg(test)]
 mod tests {
-	use super::{
-		ProbeOutcome, ProbeTracker, MAX_TIMED_OUT_PROBES, TIMED_OUT_PROBE_TTL,
-	};
+	use super::{ProbeOutcome, ProbeTracker, MAX_TIMED_OUT_PROBES, TIMED_OUT_PROBE_TTL};
 	use lightning::types::payment::PaymentHash;
 	use rand::thread_rng;
 	use std::collections::HashSet;
@@ -303,25 +309,16 @@ where
 fn prepare_probe(
 	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &FilesystemLogger,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<FilesystemLogger>>>,
-	scoring_fee_params: &ProbabilisticScoringFeeParameters,
-	pub_key_hex: &str, probe_amount: u64,
-) -> Option<PaymentHash> {
+	scoring_fee_params: &ProbabilisticScoringFeeParameters, pub_key_hex: &str, probe_amount: u64,
+) -> Result<PaymentHash, ProbeError> {
 	if probe_amount == 0 {
-		return None;
+		return Err(ProbeError::InvalidInput("probe amount must be greater than 0"));
 	}
-	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)?;
-	if let Ok(pk) = PublicKey::from_slice(&pub_key_bytes) {
-		return send_probe(
-			channel_manager,
-			pk,
-			graph,
-			logger,
-			probe_amount,
-			scorer,
-			scoring_fee_params,
-		);
-	}
-	None
+	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)
+		.ok_or(ProbeError::InvalidInput("invalid peer pubkey hex"))?;
+	let pk = PublicKey::from_slice(&pub_key_bytes)
+		.map_err(|_| ProbeError::InvalidInput("invalid peer pubkey"))?;
+	send_probe(channel_manager, pk, graph, logger, probe_amount, scorer, scoring_fee_params)
 }
 
 fn send_probe(
@@ -329,7 +326,7 @@ fn send_probe(
 	logger: &FilesystemLogger, amt_msat: u64,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<FilesystemLogger>>>,
 	scoring_fee_params: &ProbabilisticScoringFeeParameters,
-) -> Option<PaymentHash> {
+) -> Result<PaymentHash, ProbeError> {
 	let chans = channel_manager.list_usable_channels();
 	let chan_refs = chans.iter().collect::<Vec<_>>();
 	let mut payment_params = PaymentParameters::from_node_id(recipient, 144);
@@ -337,7 +334,7 @@ fn send_probe(
 	let in_flight_htlcs = channel_manager.compute_inflight_htlcs();
 	let scorer = scorer.read().unwrap();
 	let inflight_scorer = ScorerAccountingForInFlightHtlcs::new(&scorer, &in_flight_htlcs);
-	let route_res = lightning::routing::router::find_route(
+	let route = lightning::routing::router::find_route(
 		&channel_manager.get_our_node_id(),
 		&RouteParameters::from_payment_params_and_value(payment_params, amt_msat),
 		graph,
@@ -346,15 +343,11 @@ fn send_probe(
 		&inflight_scorer,
 		scoring_fee_params,
 		&[32; 32],
-	);
-	if let Ok(route) = route_res {
-		if let Some(path) = route.paths.into_iter().next() {
-			if let Ok((payment_hash, _)) = channel_manager.send_probe(path) {
-				return Some(payment_hash);
-			}
-		}
-	}
-	None
+	)
+	.map_err(ProbeError::NoRoute)?;
+	let path = route.paths.into_iter().next().ok_or(ProbeError::NoRoute("route has no paths"))?;
+	let (payment_hash, _) = channel_manager.send_probe(path).map_err(ProbeError::SendFailed)?;
+	Ok(payment_hash)
 }
 
 enum ProbeWaitResult {
@@ -471,69 +464,95 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 							amount,
 						);
 
-						if let Some(hash) = payment_hash {
-							lightning::log_info!(
-								&*logger,
-								"Probe SENT to {} for {} msat (hash: {})",
-								peer_short,
-								amount,
-								hash
-							);
+						match payment_hash {
+							Ok(hash) => {
+								lightning::log_info!(
+									&*logger,
+									"Probe SENT to {} for {} msat (hash: {})",
+									peer_short,
+									amount,
+									hash
+								);
 
-							match await_probe_result(&tracker, hash, probe_timeout).await {
-								ProbeWaitResult::Success => {
-									lightning::log_info!(
+								match await_probe_result(&tracker, hash, probe_timeout).await {
+									ProbeWaitResult::Success => {
+										lightning::log_info!(
 										&*logger,
 										"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
 										peer_pubkey,
 										amount,
 										hash
 									);
-									tokio::time::sleep(probe_delay).await;
-								},
-								ProbeWaitResult::Failed => {
-									lightning::log_warn!(
+										tokio::time::sleep(probe_delay).await;
+									},
+									ProbeWaitResult::Failed => {
+										lightning::log_warn!(
 										&*logger,
 										"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
 										peer_pubkey,
 										amount,
 										hash
 									);
-									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
-								},
-								ProbeWaitResult::Dropped => {
-									lightning::log_warn!(
+										tokio::time::sleep(probe_delay).await;
+										break 'amounts;
+									},
+									ProbeWaitResult::Dropped => {
+										lightning::log_warn!(
 										&*logger,
 										"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
 										peer_pubkey,
 										amount,
 										hash
 									);
-									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
-								},
-								ProbeWaitResult::Timeout => {
-									lightning::log_warn!(
+										tokio::time::sleep(probe_delay).await;
+										break 'amounts;
+									},
+									ProbeWaitResult::Timeout => {
+										lightning::log_warn!(
 										&*logger,
 										"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
 										peer_pubkey,
 										amount,
 										hash
 									);
-									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
-								},
-							}
-						} else {
-							lightning::log_warn!(
+										tokio::time::sleep(probe_delay).await;
+										break 'amounts;
+									},
+								}
+							},
+							Err(ProbeError::NoRoute(err)) => {
+								lightning::log_warn!(
 								&*logger,
-								"probe_completed destination_node={} amount_msat={} state=NO_ROUTE",
+								"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
 								peer_pubkey,
-								amount
+								amount,
+								err
 							);
-							tokio::time::sleep(probe_delay).await;
-							break 'amounts;
+								tokio::time::sleep(probe_delay).await;
+								break 'amounts;
+							},
+							Err(ProbeError::SendFailed(err)) => {
+								lightning::log_warn!(
+								&*logger,
+								"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
+								peer_pubkey,
+								amount,
+								err
+							);
+								tokio::time::sleep(probe_delay).await;
+								break 'amounts;
+							},
+							Err(ProbeError::InvalidInput(err)) => {
+								lightning::log_warn!(
+								&*logger,
+								"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
+								peer_pubkey,
+								amount,
+								err
+							);
+								tokio::time::sleep(probe_delay).await;
+								break 'amounts;
+							},
 						}
 					}
 
@@ -550,12 +569,14 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 					let graph_read_only = network_graph.read_only();
 					let mut rng = thread_rng();
 					reservoir_sample(
-						graph_read_only.nodes().unordered_iter().filter_map(|(node_id, _node_info)| {
-							if *node_id == our_node_id {
-								return None;
-							}
-							node_id.as_pubkey().ok()
-						}),
+						graph_read_only.nodes().unordered_iter().filter_map(
+							|(node_id, _node_info)| {
+								if *node_id == our_node_id {
+									return None;
+								}
+								node_id.as_pubkey().ok()
+							},
+						),
 						requested_count,
 						&mut rng,
 					)
@@ -583,65 +604,89 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 						&scoring_fee_params,
 					);
 
-					if let Some(hash) = payment_hash {
-						lightning::log_info!(
-							&*logger,
-							"Random probe SENT to {} for {} msat (hash: {})",
-							peer_short,
-							amount,
-							hash
-						);
+					match payment_hash {
+						Ok(hash) => {
+							lightning::log_info!(
+								&*logger,
+								"Random probe SENT to {} for {} msat (hash: {})",
+								peer_short,
+								amount,
+								hash
+							);
 
-						match await_probe_result(&tracker, hash, probe_timeout).await {
-							ProbeWaitResult::Success => {
-								lightning::log_info!(
-									&*logger,
+							match await_probe_result(&tracker, hash, probe_timeout).await {
+								ProbeWaitResult::Success => {
+									lightning::log_info!(
+										&*logger,
 									"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-								tokio::time::sleep(probe_delay).await;
-							},
-							ProbeWaitResult::Failed => {
-								lightning::log_warn!(
+									tokio::time::sleep(probe_delay).await;
+								},
+								ProbeWaitResult::Failed => {
+									lightning::log_warn!(
 									&*logger,
 									"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-								tokio::time::sleep(probe_delay).await;
-							},
-							ProbeWaitResult::Dropped => {
-								lightning::log_warn!(
+									tokio::time::sleep(probe_delay).await;
+								},
+								ProbeWaitResult::Dropped => {
+									lightning::log_warn!(
 									&*logger,
 									"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-								tokio::time::sleep(probe_delay).await;
-							},
-							ProbeWaitResult::Timeout => {
-								lightning::log_warn!(
+									tokio::time::sleep(probe_delay).await;
+								},
+								ProbeWaitResult::Timeout => {
+									lightning::log_warn!(
 									&*logger,
 									"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-								tokio::time::sleep(probe_delay).await;
-							},
-						}
-					} else {
-						lightning::log_warn!(
-							&*logger,
-							"probe_completed destination_node={} amount_msat={} state=NO_ROUTE",
-							recipient_hex,
-							amount
-						);
-						tokio::time::sleep(probe_delay).await;
+									tokio::time::sleep(probe_delay).await;
+								},
+							}
+						},
+						Err(ProbeError::NoRoute(err)) => {
+							lightning::log_warn!(
+								&*logger,
+								"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
+								recipient_hex,
+								amount,
+								err
+							);
+							tokio::time::sleep(probe_delay).await;
+						},
+						Err(ProbeError::SendFailed(err)) => {
+							lightning::log_warn!(
+								&*logger,
+								"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
+								recipient_hex,
+								amount,
+								err
+							);
+							tokio::time::sleep(probe_delay).await;
+						},
+						Err(ProbeError::InvalidInput(err)) => {
+							lightning::log_warn!(
+								&*logger,
+								"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
+								recipient_hex,
+								amount,
+								err
+							);
+							tokio::time::sleep(probe_delay).await;
+						},
 					}
 				}
 			}
