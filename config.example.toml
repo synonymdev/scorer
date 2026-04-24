@@ -19,7 +19,7 @@ interval_hours = 6
 [probing]
 interval_sec = 300
 peers = [
-    "02abc123...@1.2.3.4:9735"
+    "02abc123...f1"
 ]
 amount_msats = [1000, 10000, 100000, 1000000]
 random_min_amount_msat = 1000
