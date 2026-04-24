@@ -127,140 +127,6 @@ impl ProbeTracker {
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use super::{ProbeOutcome, ProbeTracker, MAX_TIMED_OUT_PROBES, TIMED_OUT_PROBE_TTL};
-	use lightning::types::payment::PaymentHash;
-	use rand::thread_rng;
-	use std::collections::HashSet;
-	use std::time::{Duration, Instant};
-	use tokio::sync::oneshot::error::TryRecvError;
-
-	#[test]
-	fn complete_before_register_delivers_buffered_success() {
-		let mut tracker = ProbeTracker::new();
-		let hash = PaymentHash([1; 32]);
-
-		tracker.complete_success(&hash);
-
-		let mut rx = tracker.register_probe(hash);
-		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Success)));
-	}
-
-	#[test]
-	fn complete_before_register_delivers_buffered_failed() {
-		let mut tracker = ProbeTracker::new();
-		let hash = PaymentHash([2; 32]);
-
-		tracker.complete_failed(&hash);
-
-		let mut rx = tracker.register_probe(hash);
-		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Failed)));
-	}
-
-	#[test]
-	fn register_before_complete_still_delivers_over_channel() {
-		let mut tracker = ProbeTracker::new();
-		let hash = PaymentHash([3; 32]);
-
-		let mut rx = tracker.register_probe(hash);
-		assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-
-		tracker.complete_success(&hash);
-		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Success)));
-	}
-
-	#[test]
-	fn late_completion_after_timeout_is_dropped() {
-		let mut tracker = ProbeTracker::new();
-		let hash = PaymentHash([4; 32]);
-
-		tracker.mark_timed_out(&hash);
-		tracker.complete_success(&hash);
-
-		assert!(!tracker.completed_probes.contains_key(&hash));
-		assert!(!tracker.timed_out_probes.contains_key(&hash));
-	}
-
-	#[test]
-	fn prune_removes_entries_older_than_ttl() {
-		let mut tracker = ProbeTracker::new();
-		let hash = PaymentHash([5; 32]);
-		let stale_time = Instant::now() - (TIMED_OUT_PROBE_TTL + Duration::from_secs(1));
-		tracker.timed_out_probes.insert(hash, stale_time);
-
-		tracker.prune_timed_out_probes();
-
-		assert!(!tracker.timed_out_probes.contains_key(&hash));
-	}
-
-	#[test]
-	fn prune_enforces_max_size_cap() {
-		let mut tracker = ProbeTracker::new();
-		let base = Instant::now();
-
-		for i in 0..(MAX_TIMED_OUT_PROBES + 3) {
-			let mut bytes = [0u8; 32];
-			bytes[0] = (i % 256) as u8;
-			bytes[1] = ((i / 256) % 256) as u8;
-			bytes[2] = ((i / 65536) % 256) as u8;
-			tracker
-				.timed_out_probes
-				.insert(PaymentHash(bytes), base + Duration::from_nanos(i as u64));
-		}
-
-		tracker.prune_timed_out_probes();
-
-		assert!(tracker.timed_out_probes.len() <= MAX_TIMED_OUT_PROBES);
-		assert!(!tracker.timed_out_probes.contains_key(&PaymentHash([0; 32])));
-	}
-
-	#[test]
-	fn extract_peer_pubkey_from_pubkey_and_addr() {
-		assert_eq!(super::extract_peer_pubkey("02abc123@1.2.3.4:9735"), Some("02abc123"));
-	}
-
-	#[test]
-	fn extract_peer_pubkey_from_raw_pubkey() {
-		assert_eq!(super::extract_peer_pubkey("02abc123"), Some("02abc123"));
-	}
-
-	#[test]
-	fn extract_peer_pubkey_rejects_empty_pubkey() {
-		assert_eq!(super::extract_peer_pubkey("@1.2.3.4:9735"), None);
-		assert_eq!(super::extract_peer_pubkey("   "), None);
-	}
-
-	#[test]
-	fn reservoir_sample_is_bounded_and_unique() {
-		let mut rng = thread_rng();
-		let sample = super::reservoir_sample(0..100usize, 8, &mut rng);
-
-		assert_eq!(sample.len(), 8);
-		assert!(sample.iter().all(|value| *value < 100));
-		let unique = sample.iter().copied().collect::<HashSet<_>>();
-		assert_eq!(unique.len(), sample.len());
-	}
-
-	#[test]
-	fn reservoir_sample_returns_all_when_k_exceeds_population() {
-		let mut rng = thread_rng();
-		let sample = super::reservoir_sample(vec![1usize, 2, 3], 10, &mut rng);
-
-		assert_eq!(sample.len(), 3);
-		let values = sample.into_iter().collect::<HashSet<_>>();
-		assert_eq!(values, HashSet::from([1usize, 2, 3]));
-	}
-
-	#[test]
-	fn reservoir_sample_returns_empty_when_no_candidates() {
-		let mut rng = thread_rng();
-		let sample = super::reservoir_sample(Vec::<usize>::new(), 5, &mut rng);
-
-		assert!(sample.is_empty());
-	}
-}
-
 fn truncate_pubkey(pubkey: &str) -> String {
 	if pubkey.len() > 12 {
 		format!("{}...", &pubkey[..12])
@@ -452,7 +318,6 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 						);
 						continue;
 					};
-					let peer_short = truncate_pubkey(peer_pubkey);
 					'amounts: for &amount in &sorted_amounts {
 						let payment_hash = prepare_probe(
 							&channel_manager,
@@ -466,14 +331,6 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 
 						match payment_hash {
 							Ok(hash) => {
-								lightning::log_info!(
-									&*logger,
-									"Probe SENT to {} for {} msat (hash: {})",
-									peer_short,
-									amount,
-									hash
-								);
-
 								match await_probe_result(&tracker, hash, probe_timeout).await {
 									ProbeWaitResult::Success => {
 										lightning::log_info!(
@@ -592,7 +449,6 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 
 				for recipient in random_recipients {
 					let recipient_hex = hex_utils::hex_str(&recipient.serialize());
-					let peer_short = truncate_pubkey(&recipient_hex);
 					let amount = probe_config.random_min_amount_msat;
 					let payment_hash = send_probe(
 						&channel_manager,
@@ -605,57 +461,47 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 					);
 
 					match payment_hash {
-						Ok(hash) => {
-							lightning::log_info!(
-								&*logger,
-								"Random probe SENT to {} for {} msat (hash: {})",
-								peer_short,
-								amount,
-								hash
-							);
-
-							match await_probe_result(&tracker, hash, probe_timeout).await {
-								ProbeWaitResult::Success => {
-									lightning::log_info!(
+						Ok(hash) => match await_probe_result(&tracker, hash, probe_timeout).await {
+							ProbeWaitResult::Success => {
+								lightning::log_info!(
 										&*logger,
 									"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-									tokio::time::sleep(probe_delay).await;
-								},
-								ProbeWaitResult::Failed => {
-									lightning::log_warn!(
+								tokio::time::sleep(probe_delay).await;
+							},
+							ProbeWaitResult::Failed => {
+								lightning::log_warn!(
 									&*logger,
 									"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-									tokio::time::sleep(probe_delay).await;
-								},
-								ProbeWaitResult::Dropped => {
-									lightning::log_warn!(
+								tokio::time::sleep(probe_delay).await;
+							},
+							ProbeWaitResult::Dropped => {
+								lightning::log_warn!(
 									&*logger,
 									"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-									tokio::time::sleep(probe_delay).await;
-								},
-								ProbeWaitResult::Timeout => {
-									lightning::log_warn!(
+								tokio::time::sleep(probe_delay).await;
+							},
+							ProbeWaitResult::Timeout => {
+								lightning::log_warn!(
 									&*logger,
 									"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
 									recipient_hex,
 									amount,
 									hash
 								);
-									tokio::time::sleep(probe_delay).await;
-								},
-							}
+								tokio::time::sleep(probe_delay).await;
+							},
 						},
 						Err(ProbeError::NoRoute(err)) => {
 							lightning::log_warn!(
@@ -692,4 +538,138 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 			}
 		}
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ProbeOutcome, ProbeTracker, MAX_TIMED_OUT_PROBES, TIMED_OUT_PROBE_TTL};
+	use lightning::types::payment::PaymentHash;
+	use rand::thread_rng;
+	use std::collections::HashSet;
+	use std::time::{Duration, Instant};
+	use tokio::sync::oneshot::error::TryRecvError;
+
+	#[test]
+	fn complete_before_register_delivers_buffered_success() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([1; 32]);
+
+		tracker.complete_success(&hash);
+
+		let mut rx = tracker.register_probe(hash);
+		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Success)));
+	}
+
+	#[test]
+	fn complete_before_register_delivers_buffered_failed() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([2; 32]);
+
+		tracker.complete_failed(&hash);
+
+		let mut rx = tracker.register_probe(hash);
+		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Failed)));
+	}
+
+	#[test]
+	fn register_before_complete_still_delivers_over_channel() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([3; 32]);
+
+		let mut rx = tracker.register_probe(hash);
+		assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+		tracker.complete_success(&hash);
+		assert!(matches!(rx.try_recv(), Ok(ProbeOutcome::Success)));
+	}
+
+	#[test]
+	fn late_completion_after_timeout_is_dropped() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([4; 32]);
+
+		tracker.mark_timed_out(&hash);
+		tracker.complete_success(&hash);
+
+		assert!(!tracker.completed_probes.contains_key(&hash));
+		assert!(!tracker.timed_out_probes.contains_key(&hash));
+	}
+
+	#[test]
+	fn prune_removes_entries_older_than_ttl() {
+		let mut tracker = ProbeTracker::new();
+		let hash = PaymentHash([5; 32]);
+		let stale_time = Instant::now() - (TIMED_OUT_PROBE_TTL + Duration::from_secs(1));
+		tracker.timed_out_probes.insert(hash, stale_time);
+
+		tracker.prune_timed_out_probes();
+
+		assert!(!tracker.timed_out_probes.contains_key(&hash));
+	}
+
+	#[test]
+	fn prune_enforces_max_size_cap() {
+		let mut tracker = ProbeTracker::new();
+		let base = Instant::now();
+
+		for i in 0..(MAX_TIMED_OUT_PROBES + 3) {
+			let mut bytes = [0u8; 32];
+			bytes[0] = (i % 256) as u8;
+			bytes[1] = ((i / 256) % 256) as u8;
+			bytes[2] = ((i / 65536) % 256) as u8;
+			tracker
+				.timed_out_probes
+				.insert(PaymentHash(bytes), base + Duration::from_nanos(i as u64));
+		}
+
+		tracker.prune_timed_out_probes();
+
+		assert!(tracker.timed_out_probes.len() <= MAX_TIMED_OUT_PROBES);
+		assert!(!tracker.timed_out_probes.contains_key(&PaymentHash([0; 32])));
+	}
+
+	#[test]
+	fn extract_peer_pubkey_from_pubkey_and_addr() {
+		assert_eq!(super::extract_peer_pubkey("02abc123@1.2.3.4:9735"), Some("02abc123"));
+	}
+
+	#[test]
+	fn extract_peer_pubkey_from_raw_pubkey() {
+		assert_eq!(super::extract_peer_pubkey("02abc123"), Some("02abc123"));
+	}
+
+	#[test]
+	fn extract_peer_pubkey_rejects_empty_pubkey() {
+		assert_eq!(super::extract_peer_pubkey("@1.2.3.4:9735"), None);
+		assert_eq!(super::extract_peer_pubkey("   "), None);
+	}
+
+	#[test]
+	fn reservoir_sample_is_bounded_and_unique() {
+		let mut rng = thread_rng();
+		let sample = super::reservoir_sample(0..100usize, 8, &mut rng);
+
+		assert_eq!(sample.len(), 8);
+		assert!(sample.iter().all(|value| *value < 100));
+		let unique = sample.iter().copied().collect::<HashSet<_>>();
+		assert_eq!(unique.len(), sample.len());
+	}
+
+	#[test]
+	fn reservoir_sample_returns_all_when_k_exceeds_population() {
+		let mut rng = thread_rng();
+		let sample = super::reservoir_sample(vec![1usize, 2, 3], 10, &mut rng);
+
+		assert_eq!(sample.len(), 3);
+		let values = sample.into_iter().collect::<HashSet<_>>();
+		assert_eq!(values, HashSet::from([1usize, 2, 3]));
+	}
+
+	#[test]
+	fn reservoir_sample_returns_empty_when_no_candidates() {
+		let mut rng = thread_rng();
+		let sample = super::reservoir_sample(Vec::<usize>::new(), 5, &mut rng);
+
+		assert!(sample.is_empty());
+	}
 }
